@@ -66,7 +66,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.Close
@@ -78,10 +80,12 @@ import androidx.compose.material.icons.rounded.PhotoCamera
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -130,6 +134,7 @@ import com.google.ai.edge.gallery.data.MAX_IMAGE_COUNT_AI_CORE
 import com.google.ai.edge.gallery.data.RuntimeType
 import com.google.ai.edge.gallery.data.SAMPLE_RATE
 import com.google.ai.edge.gallery.data.Task
+import com.google.ai.edge.gallery.data.rag.RagState
 import com.google.ai.edge.gallery.ui.common.getTaskIconColor
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.theme.bodyLargeNarrow
@@ -174,6 +179,13 @@ fun MessageInputText(
   showAudioPicker: Boolean = false,
   showStopButtonWhenInProgress: Boolean = false,
   onImageLimitExceeded: () -> Unit = {},
+  showPdfPicker: Boolean = false,
+  showRagToggle: Boolean = false,
+  ragEnabled: Boolean = false,
+  ragState: RagState = RagState.Empty,
+  onPickPdf: () -> Unit = {},
+  onToggleRag: () -> Unit = {},
+  onClearRag: () -> Unit = {},
 ) {
   val context = LocalContext.current
   val lifecycleOwner = LocalLifecycleOwner.current
@@ -353,6 +365,51 @@ fun MessageInputText(
         }
 
         Spacer(modifier = Modifier.width(16.dp))
+      }
+    }
+
+    // RAG active-document chip / "attach a PDF" hint.
+    if (showRagToggle || showPdfPicker) {
+      val chipModifier = Modifier.padding(start = 8.dp, end = 8.dp, bottom = 4.dp)
+      when (val s = ragState) {
+        is RagState.Ready -> {
+          AssistChip(
+            onClick = { /* no-op */ },
+            label = { Text("\uD83D\uDCC4 ${s.docName} (${s.chunkCount} chunks)") },
+            trailingIcon = {
+              IconButton(onClick = onClearRag) {
+                Icon(
+                  imageVector = Icons.Rounded.Close,
+                  contentDescription = "Clear PDF",
+                )
+              }
+            },
+            modifier = chipModifier,
+          )
+        }
+        is RagState.Indexing -> {
+          AssistChip(
+            onClick = {},
+            label = { Text("Indexing… ${(s.progress * 100).toInt()}%") },
+            modifier = chipModifier,
+          )
+        }
+        is RagState.Error -> {
+          AssistChip(
+            onClick = {},
+            label = { Text("RAG: ${s.error.message ?: "Indexing failed"}") },
+            modifier = chipModifier,
+          )
+        }
+        RagState.Empty -> {
+          if (ragEnabled) {
+            AssistChip(
+              onClick = onPickPdf,
+              label = { Text("Attach a PDF to use RAG") },
+              modifier = chipModifier,
+            )
+          }
+        }
       }
     }
 
@@ -580,6 +637,25 @@ fun MessageInputText(
                         )
                       }
 
+                      // Attach PDF for RAG.
+                      if (showPdfPicker) {
+                        DropdownMenuItem(
+                          text = {
+                            Row(
+                              verticalAlignment = Alignment.CenterVertically,
+                              horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                              Icon(Icons.Filled.PictureAsPdf, contentDescription = null)
+                              Text("Attach PDF (RAG)")
+                            }
+                          },
+                          onClick = {
+                            showAddContentMenu = false
+                            onPickPdf()
+                          },
+                        )
+                      }
+
                       // Prompt history.
                       DropdownMenuItem(
                         text = {
@@ -606,6 +682,18 @@ fun MessageInputText(
                       enabled = !inProgress && !isResettingSession && !modelInitializing,
                     ) {
                       Text(stringResource(R.string.skills))
+                    }
+                  }
+
+                  // RAG toggle.
+                  if (showRagToggle) {
+                    IconButton(onClick = onToggleRag) {
+                      Icon(
+                        imageVector = Icons.AutoMirrored.Filled.MenuBook,
+                        contentDescription = if (ragEnabled) "RAG enabled" else "RAG disabled",
+                        tint = if (ragEnabled) MaterialTheme.colorScheme.primary
+                               else LocalContentColor.current,
+                      )
                     }
                   }
                 }
