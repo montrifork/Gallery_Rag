@@ -393,6 +393,11 @@ constructor(
     allowThinking: Boolean,
   ) {
     if (ragEnabled.value && ragState.value is RagState.Ready) {
+      // Set busy flags synchronously so a fast double-tap on send is gated immediately,
+      // even though retrieval and the actual super-call happen asynchronously below.
+      // super.generateResponse will call setInProgress(true)/setPreparing(true) again — these are idempotent.
+      setInProgress(true)
+      setPreparing(true)
       // Retrieval is suspending; do it in a coroutine then call super.
       viewModelScope.launch {
         val scored = ragRepository.retrieve(input, k = 4)
