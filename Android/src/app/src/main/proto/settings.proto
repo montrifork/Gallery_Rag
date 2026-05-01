@@ -81,6 +81,9 @@ message Settings {
 
   // Whether RAG (PDF-backed retrieval) is enabled in the LLM chat.
   bool rag_enabled = 11;
+
+  // Whether the bundled default RAG PDF has been ingested at least once.
+  bool default_pdf_ingested = 12;
 }
 
 message UserData {

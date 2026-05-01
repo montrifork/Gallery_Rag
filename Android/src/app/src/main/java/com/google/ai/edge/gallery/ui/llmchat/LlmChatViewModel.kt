@@ -365,6 +365,23 @@ constructor(
       initialValue = dataStoreRepository.getRagEnabled(),
     )
 
+  init {
+    // Bootstrap the bundled default PDF on first ever launch so users have a working
+    // RAG demo without needing to attach anything. Idempotent across launches.
+    if (!dataStoreRepository.getDefaultPdfIngested() && ragState.value is RagState.Empty) {
+      viewModelScope.launch {
+        val result = ragRepository.ingestAsset(DEFAULT_PDF_ASSET)
+        if (result.isSuccess) {
+          dataStoreRepository.setDefaultPdfIngested(true)
+          // Auto-enable RAG so the default PDF is actually used until the user toggles it off.
+          dataStoreRepository.setRagEnabled(true)
+        } else {
+          Log.w(TAG, "Failed to auto-ingest default PDF", result.exceptionOrNull())
+        }
+      }
+    }
+  }
+
   fun setRagEnabled(enabled: Boolean) {
     dataStoreRepository.setRagEnabled(enabled)
   }
@@ -413,6 +430,10 @@ constructor(
     super.generateResponse(
       model, input, images, audioMessages, onFirstToken, onDone, onError, allowThinking
     )
+  }
+
+  companion object {
+    private const val DEFAULT_PDF_ASSET = "health_triage_kb.pdf"
   }
 }
 

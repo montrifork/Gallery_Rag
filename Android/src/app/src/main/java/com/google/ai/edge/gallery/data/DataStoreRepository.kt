@@ -120,6 +120,12 @@ interface DataStoreRepository {
 
   /** Flow of the current rag_enabled value. */
   fun ragEnabledFlow(): Flow<Boolean>
+
+  /** Returns whether the bundled default PDF has been ingested at least once. */
+  fun getDefaultPdfIngested(): Boolean
+
+  /** Marks the bundled default PDF as ingested so we don't re-ingest on later launches. */
+  fun setDefaultPdfIngested(ingested: Boolean)
 }
 
 /** Repository for managing data using Proto DataStore. */
@@ -460,5 +466,20 @@ class DefaultDataStoreRepository(
 
   override fun ragEnabledFlow(): Flow<Boolean> {
     return dataStore.data.map { it.ragEnabled }
+  }
+
+  override fun getDefaultPdfIngested(): Boolean {
+    return runBlocking {
+      val settings = dataStore.data.first()
+      settings.defaultPdfIngested
+    }
+  }
+
+  override fun setDefaultPdfIngested(ingested: Boolean) {
+    runBlocking {
+      dataStore.updateData { settings ->
+        settings.toBuilder().setDefaultPdfIngested(ingested).build()
+      }
+    }
   }
 }

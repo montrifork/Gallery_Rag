@@ -29,6 +29,14 @@ import kotlinx.serialization.json.Json
 interface RagRepository {
   val state: StateFlow<RagState>
   suspend fun ingestPdf(uri: Uri): Result<Unit>
+
+  /**
+   * Ingests a PDF bundled in the app's assets. The display name shown to the user is
+   * [assetName] (e.g., "health_triage_kb.pdf"). Implementations copy the asset to a cache
+   * file and run the same indexing pipeline as [ingestPdf].
+   */
+  suspend fun ingestAsset(assetName: String): Result<Unit>
+
   suspend fun clear()
   suspend fun retrieve(query: String, k: Int = 4): List<ScoredChunk>
 
@@ -65,12 +73,37 @@ class DefaultRagRepository(
     }
   }
 
-  override suspend fun ingestPdf(uri: Uri): Result<Unit> = mutex.withLock {
+  override suspend fun ingestPdf(uri: Uri): Result<Unit> = ingestInternal(uri, displayNameOverride = null)
+
+  override suspend fun ingestAsset(assetName: String): Result<Unit> {
+    val cacheFile = try {
+      withContext(Dispatchers.IO) {
+        val out = File(context.cacheDir, "rag_assets/$assetName").apply {
+          parentFile?.mkdirs()
+        }
+        context.assets.open(assetName).use { input ->
+          out.outputStream().use { output -> input.copyTo(output) }
+        }
+        out
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (t: Throwable) {
+      Log.w(TAG, "Failed to stage bundled asset '$assetName'", t)
+      return Result.failure(RagError.FileOpenFailed(t))
+    }
+    return ingestInternal(Uri.fromFile(cacheFile), displayNameOverride = assetName)
+  }
+
+  private suspend fun ingestInternal(
+    uri: Uri,
+    displayNameOverride: String?,
+  ): Result<Unit> = mutex.withLock {
     val previous = current
     try {
       _state.value = RagState.Indexing(0f)
 
-      val docName = queryDisplayName(uri) ?: "document.pdf"
+      val docName = displayNameOverride ?: queryDisplayName(uri) ?: "document.pdf"
 
       // Extract (0.0 -> 0.4)
       val pages = extractor.extract(uri)
