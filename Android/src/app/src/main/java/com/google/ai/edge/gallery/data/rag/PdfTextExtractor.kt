@@ -16,6 +16,7 @@ import android.util.Log
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -48,6 +49,8 @@ class PdfBoxTextExtractor(private val context: Context) : PdfTextExtractor {
     input.use { stream ->
       val doc = try {
         PDDocument.load(stream)
+      } catch (e: CancellationException) {
+        throw e
       } catch (e: Throwable) {
         Log.w(TAG, "PdfBox failed to load document", e)
         throw RagError.NotAPdf(e)
