@@ -18,11 +18,15 @@ package com.google.ai.edge.gallery.ui.llmchat
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.viewModelScope
 import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.Task
+import com.google.ai.edge.gallery.data.rag.RagRepository
+import com.google.ai.edge.gallery.data.rag.RagState
 import com.google.ai.edge.gallery.runtime.runtimeHelper
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageAudioClip
 import com.google.ai.edge.gallery.ui.common.chat.ChatMessageError
@@ -41,13 +45,16 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 private const val TAG = "AGLlmChatViewModel"
 
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
-  fun generateResponse(
+  open fun generateResponse(
     model: Model,
     input: String,
     images: List<Bitmap> = listOf(),
@@ -341,7 +348,68 @@ open class LlmChatViewModelBase() : ChatViewModel() {
   }
 }
 
-@HiltViewModel class LlmChatViewModel @Inject constructor() : LlmChatViewModelBase()
+@HiltViewModel
+class LlmChatViewModel
+@Inject
+constructor(
+  private val ragRepository: RagRepository,
+  private val dataStoreRepository: DataStoreRepository,
+) : LlmChatViewModelBase() {
+
+  val ragState: StateFlow<RagState> = ragRepository.state
+
+  val ragEnabled: StateFlow<Boolean> =
+    dataStoreRepository.ragEnabledFlow().stateIn(
+      scope = viewModelScope,
+      started = SharingStarted.Eagerly,
+      initialValue = dataStoreRepository.getRagEnabled(),
+    )
+
+  fun setRagEnabled(enabled: Boolean) {
+    dataStoreRepository.setRagEnabled(enabled)
+  }
+
+  fun ingestPdf(uri: Uri, onError: (String) -> Unit = {}) {
+    viewModelScope.launch {
+      val result = ragRepository.ingestPdf(uri)
+      result.exceptionOrNull()?.let { e ->
+        onError(e.message ?: "Failed to ingest PDF")
+      }
+    }
+  }
+
+  fun clearRag() {
+    viewModelScope.launch { ragRepository.clear() }
+  }
+
+  override fun generateResponse(
+    model: Model,
+    input: String,
+    images: List<Bitmap>,
+    audioMessages: List<ChatMessageAudioClip>,
+    onFirstToken: (Model) -> Unit,
+    onDone: () -> Unit,
+    onError: (String) -> Unit,
+    allowThinking: Boolean,
+  ) {
+    if (ragEnabled.value && ragState.value is RagState.Ready) {
+      // Retrieval is suspending; do it in a coroutine then call super.
+      viewModelScope.launch {
+        val scored = ragRepository.retrieve(input, k = 4)
+        val prefix = ragRepository.formatContext(scored)
+        val prefixed = if (prefix.isEmpty()) input else prefix + input
+        super@LlmChatViewModel.generateResponse(
+          model, prefixed, images, audioMessages, onFirstToken, onDone, onError, allowThinking
+        )
+      }
+      return
+    }
+
+    super.generateResponse(
+      model, input, images, audioMessages, onFirstToken, onDone, onError, allowThinking
+    )
+  }
+}
 
 @HiltViewModel class LlmAskImageViewModel @Inject constructor() : LlmChatViewModelBase()
 
