@@ -67,7 +67,6 @@ class DefaultRagRepository(
 
   override suspend fun ingestPdf(uri: Uri): Result<Unit> = mutex.withLock {
     val previous = current
-    val previousState = _state.value
     try {
       _state.value = RagState.Indexing(0f)
 
@@ -82,7 +81,7 @@ class DefaultRagRepository(
 
       // Chunk (0.4 -> 0.6)
       val chunks = try {
-        Chunker.chunk(pages)
+        withContext(Dispatchers.Default) { Chunker.chunk(pages) }
       } catch (e: CancellationException) {
         throw e
       } catch (t: Throwable) {
@@ -92,7 +91,9 @@ class DefaultRagRepository(
 
       // Index (0.6 -> 0.9)
       val index = try {
-        Bm25Index.build(chunks, docName = docName, createdAtMs = System.currentTimeMillis())
+        withContext(Dispatchers.Default) {
+          Bm25Index.build(chunks, docName = docName, createdAtMs = System.currentTimeMillis())
+        }
       } catch (e: CancellationException) {
         throw e
       } catch (t: Throwable) {
@@ -128,14 +129,12 @@ class DefaultRagRepository(
       Log.w(TAG, "Ingestion failed", e)
       // Restore previous good state.
       current = previous
-      _state.value = if (previous != null && previousState is RagState.Ready) previousState
-                     else RagState.Empty
+      _state.value = previous?.let { RagState.Ready(it.docName, it.chunks.size) } ?: RagState.Empty
       Result.failure(e)
     } catch (t: Throwable) {
       Log.e(TAG, "Unexpected ingestion error", t)
       current = previous
-      _state.value = if (previous != null && previousState is RagState.Ready) previousState
-                     else RagState.Empty
+      _state.value = previous?.let { RagState.Ready(it.docName, it.chunks.size) } ?: RagState.Empty
       Result.failure(RagError.IndexBuildFailed(t))
     }
   }
