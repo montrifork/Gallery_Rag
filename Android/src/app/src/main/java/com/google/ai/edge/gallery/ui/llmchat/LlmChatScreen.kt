@@ -19,8 +19,12 @@ package com.google.ai.edge.gallery.ui.llmchat
 import androidx.hilt.navigation.compose.hiltViewModel
 
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,12 +33,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.ai.edge.gallery.data.rag.RagState
+import kotlinx.coroutines.flow.MutableStateFlow
 import com.google.ai.edge.gallery.GalleryEvent
 import com.google.ai.edge.gallery.R
 import com.google.ai.edge.gallery.data.BuiltInTaskId
@@ -93,6 +102,8 @@ fun LlmChatScreen(
     sendMessageTrigger = sendMessageTrigger,
     showImagePicker = showImagePicker,
     showAudioPicker = showAudioPicker,
+    showPdfPicker = true,
+    showRagToggle = true,
     getActiveSkills = getActiveSkills,
   )
 }
@@ -191,10 +202,29 @@ fun ChatViewWrapper(
   sendMessageTrigger: SendMessageTrigger? = null,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
+  showPdfPicker: Boolean = false,
+  showRagToggle: Boolean = false,
   getActiveSkills: () -> List<String> = { emptyList() },
 ) {
   val context = LocalContext.current
   val task = modelManagerViewModel.getTaskById(id = taskId)!!
+
+  // Cast to the text-only subclass to access RAG APIs. Other subclasses don't have them.
+  val llmVm = viewModel as? LlmChatViewModel
+  val ragStateFlow = remember(llmVm) { llmVm?.ragState ?: MutableStateFlow(RagState.Empty) }
+  val ragEnabledFlow = remember(llmVm) { llmVm?.ragEnabled ?: MutableStateFlow(false) }
+  val ragState by ragStateFlow.collectAsStateWithLifecycle()
+  val ragEnabled by ragEnabledFlow.collectAsStateWithLifecycle()
+
+  val pdfPicker = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocument()
+  ) { uri: Uri? ->
+    if (uri != null) {
+      llmVm?.ingestPdf(uri) { msg ->
+        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+      }
+    }
+  }
 
   ChatView(
     task = task,
@@ -306,5 +336,12 @@ fun ChatViewWrapper(
     onSystemPromptChanged = onSystemPromptChanged,
     sendMessageTrigger = sendMessageTrigger,
     showAudioPicker = showAudioPicker,
+    showPdfPicker = showPdfPicker,
+    showRagToggle = showRagToggle,
+    ragEnabled = ragEnabled,
+    ragState = ragState,
+    onPickPdf = { pdfPicker.launch(arrayOf("application/pdf")) },
+    onToggleRag = { llmVm?.setRagEnabled(!ragEnabled) },
+    onClearRag = { llmVm?.clearRag() },
   )
 }
