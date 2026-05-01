@@ -120,6 +120,13 @@ fun ChatPanel(
   showStopButtonInInputWhenInProgress: Boolean = false,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
+  showPdfPicker: Boolean = false,
+  showRagToggle: Boolean = false,
+  ragEnabled: Boolean = false,
+  ragState: com.google.ai.edge.gallery.data.rag.RagState = com.google.ai.edge.gallery.data.rag.RagState.Empty,
+  onPickPdf: () -> Unit = {},
+  onToggleRag: () -> Unit = {},
+  onClearRag: () -> Unit = {},
   emptyStateComposable: @Composable (Model) -> Unit = {},
 ) {
   val uiState by viewModel.uiState.collectAsState()
@@ -581,6 +588,13 @@ fun ChatPanel(
         showSkillsPicker = task.id === BuiltInTaskId.LLM_AGENT_CHAT,
         showImagePicker = selectedModel.llmSupportImage && showImagePicker,
         showAudioPicker = selectedModel.llmSupportAudio && showAudioPicker,
+        showPdfPicker = showPdfPicker,
+        showRagToggle = showRagToggle,
+        ragEnabled = ragEnabled,
+        ragState = ragState,
+        onPickPdf = onPickPdf,
+        onToggleRag = onToggleRag,
+        onClearRag = onClearRag,
         showStopButtonWhenInProgress = showStopButtonInInputWhenInProgress,
         onImageLimitExceeded = { showImageLimitBanner = true },
       )

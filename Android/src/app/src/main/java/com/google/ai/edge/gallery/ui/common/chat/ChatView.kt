@@ -253,6 +253,13 @@ fun ChatView(
                 showStopButtonInInputWhenInProgress = showStopButtonInInputWhenInProgress,
                 showImagePicker = showImagePicker,
                 showAudioPicker = showAudioPicker,
+                showPdfPicker = showPdfPicker,
+                showRagToggle = showRagToggle,
+                ragEnabled = ragEnabled,
+                ragState = ragState,
+                onPickPdf = onPickPdf,
+                onToggleRag = onToggleRag,
+                onClearRag = onClearRag,
                 emptyStateComposable = emptyStateComposable,
               )
             // Model download
