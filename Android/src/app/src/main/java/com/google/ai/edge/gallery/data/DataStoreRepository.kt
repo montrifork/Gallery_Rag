@@ -28,7 +28,9 @@ import com.google.ai.edge.gallery.proto.Skill
 import com.google.ai.edge.gallery.proto.Skills
 import com.google.ai.edge.gallery.proto.Theme
 import com.google.ai.edge.gallery.proto.UserData
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 
 // TODO(b/423700720): Change to async (suspend) functions
@@ -109,6 +111,15 @@ interface DataStoreRepository {
 
   /** Returns whether a promo with the specified ID has been viewed. */
   fun hasViewedPromo(promoId: String): Boolean
+
+  /** Returns whether RAG (PDF retrieval) is enabled in the LLM chat. */
+  fun getRagEnabled(): Boolean
+
+  /** Sets whether RAG (PDF retrieval) is enabled in the LLM chat. */
+  fun setRagEnabled(enabled: Boolean)
+
+  /** Flow of the current rag_enabled value. */
+  fun ragEnabledFlow(): Flow<Boolean>
 }
 
 /** Repository for managing data using Proto DataStore. */
@@ -432,5 +443,22 @@ class DefaultDataStoreRepository(
       val settings = dataStore.data.first()
       settings.viewedPromoIdList.contains(promoId)
     }
+  }
+
+  override fun getRagEnabled(): Boolean {
+    return runBlocking {
+      val settings = dataStore.data.first()
+      settings.ragEnabled
+    }
+  }
+
+  override fun setRagEnabled(enabled: Boolean) {
+    runBlocking {
+      dataStore.updateData { settings -> settings.toBuilder().setRagEnabled(enabled).build() }
+    }
+  }
+
+  override fun ragEnabledFlow(): Flow<Boolean> {
+    return dataStore.data.map { it.ragEnabled }
   }
 }
