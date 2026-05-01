@@ -32,6 +32,10 @@ import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.DefaultDataStoreRepository
 import com.google.ai.edge.gallery.data.DefaultDownloadRepository
 import com.google.ai.edge.gallery.data.DownloadRepository
+import com.google.ai.edge.gallery.data.rag.DefaultRagRepository
+import com.google.ai.edge.gallery.data.rag.PdfBoxTextExtractor
+import com.google.ai.edge.gallery.data.rag.PdfTextExtractor
+import com.google.ai.edge.gallery.data.rag.RagRepository
 import com.google.ai.edge.gallery.proto.BenchmarkResults
 import com.google.ai.edge.gallery.proto.CutoutCollection
 import com.google.ai.edge.gallery.proto.Settings
@@ -182,5 +186,22 @@ internal object AppModule {
     lifecycleProvider: AppLifecycleProvider,
   ): DownloadRepository {
     return DefaultDownloadRepository(context, lifecycleProvider)
+  }
+
+  // Provides PdfTextExtractor
+  @Provides
+  @Singleton
+  fun providePdfTextExtractor(@ApplicationContext context: Context): PdfTextExtractor {
+    return PdfBoxTextExtractor(context)
+  }
+
+  // Provides RagRepository
+  @Provides
+  @Singleton
+  fun provideRagRepository(
+    @ApplicationContext context: Context,
+    extractor: PdfTextExtractor,
+  ): RagRepository {
+    return DefaultRagRepository(context, extractor)
   }
 }
