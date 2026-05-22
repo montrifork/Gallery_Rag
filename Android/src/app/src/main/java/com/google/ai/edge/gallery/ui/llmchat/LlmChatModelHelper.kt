@@ -162,8 +162,53 @@ object LlmChatModelHelper : LlmModelHelper {
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
   ) {
+    rebuildConversationInternal(
+      model = model,
+      initialMessages = emptyList(),
+      supportImage = supportImage,
+      supportAudio = supportAudio,
+      systemInstruction = systemInstruction,
+      tools = tools,
+      enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+    )
+  }
+
+  @OptIn(ExperimentalApi::class)
+  override fun rebuildConversationWithHistory(
+    model: Model,
+    initialMessages: List<Message>,
+    supportImage: Boolean,
+    supportAudio: Boolean,
+    systemInstruction: Contents?,
+    tools: List<ToolProvider>,
+    enableConversationConstrainedDecoding: Boolean,
+  ) {
+    rebuildConversationInternal(
+      model = model,
+      initialMessages = initialMessages,
+      supportImage = supportImage,
+      supportAudio = supportAudio,
+      systemInstruction = systemInstruction,
+      tools = tools,
+      enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+    )
+  }
+
+  @OptIn(ExperimentalApi::class)
+  private fun rebuildConversationInternal(
+    model: Model,
+    initialMessages: List<Message>,
+    supportImage: Boolean,
+    supportAudio: Boolean,
+    systemInstruction: Contents?,
+    tools: List<ToolProvider>,
+    enableConversationConstrainedDecoding: Boolean,
+  ) {
     try {
-      Log.d(TAG, "Resetting conversation for model '${model.name}'")
+      Log.d(
+        TAG,
+        "Rebuilding conversation for model '${model.name}' with ${initialMessages.size} prior messages",
+      )
 
       val instance = model.instance as LlmModelInstance? ?: return
       instance.conversation.close()
@@ -198,15 +243,16 @@ object LlmChatModelHelper : LlmModelHelper {
                 )
               },
             systemInstruction = systemInstruction,
+            initialMessages = initialMessages,
             tools = tools,
           )
         )
       ExperimentalFlags.enableConversationConstrainedDecoding = false
       instance.conversation = newConversation
 
-      Log.d(TAG, "Resetting done")
+      Log.d(TAG, "Conversation rebuild done")
     } catch (e: Exception) {
-      Log.d(TAG, "Failed to reset conversation", e)
+      Log.d(TAG, "Failed to rebuild conversation", e)
     }
   }
 

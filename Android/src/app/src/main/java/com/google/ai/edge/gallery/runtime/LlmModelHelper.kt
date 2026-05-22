@@ -20,6 +20,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.ToolProvider
 import kotlinx.coroutines.CoroutineScope
 
@@ -78,6 +79,33 @@ interface LlmModelHelper {
     tools: List<ToolProvider> = listOf(),
     enableConversationConstrainedDecoding: Boolean = false,
   )
+
+  /**
+   * Rebuilds the underlying conversation with a curated [initialMessages] history seeded as
+   * `ConversationConfig.initialMessages`. Used by the RAG flow to keep prior clean Q/A turns
+   * while dropping stale RAG context from the KV cache.
+   *
+   * Default implementation falls back to [resetConversation] (history is lost). Runtimes that
+   * support seeding history should override this.
+   */
+  fun rebuildConversationWithHistory(
+    model: Model,
+    initialMessages: List<Message>,
+    supportImage: Boolean = false,
+    supportAudio: Boolean = false,
+    systemInstruction: Contents? = null,
+    tools: List<ToolProvider> = listOf(),
+    enableConversationConstrainedDecoding: Boolean = false,
+  ) {
+    resetConversation(
+      model = model,
+      supportImage = supportImage,
+      supportAudio = supportAudio,
+      systemInstruction = systemInstruction,
+      tools = tools,
+      enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+    )
+  }
 
   /**
    * Cleans up resources occupied by the model.

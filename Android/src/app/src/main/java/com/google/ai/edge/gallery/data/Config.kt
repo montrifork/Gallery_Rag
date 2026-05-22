@@ -230,12 +230,18 @@ fun createLlmChatConfigs(
   var maxTokensConfig: Config =
     LabelConfig(key = ConfigKeys.MAX_TOKENS, defaultValue = "$defaultMaxToken")
   if (defaultMaxContextLength != null) {
+    // Pick a default large enough for a RAG-augmented turn (prefix ~3k tokens + headroom for
+    // a few clean conversational turns) but small enough that the LiteRT-LM engine's KV-cache
+    // allocation does not OOM the device. Defaulting to the full advertised context window
+    // (e.g. 32k for Gemma 3) triggered a low-memory kill cascade on real devices.
+    // Cap at 8000 tokens; power users can raise the slider up to `defaultMaxContextLength`.
+    val sliderDefault = maxOf(defaultMaxToken, minOf(defaultMaxContextLength, 8000))
     maxTokensConfig =
       NumberSliderConfig(
         key = ConfigKeys.MAX_TOKENS,
         sliderMin = 2000f,
         sliderMax = defaultMaxContextLength.toFloat(),
-        defaultValue = defaultMaxToken.toFloat(),
+        defaultValue = sliderDefault.toFloat(),
         valueType = ValueType.INT,
       )
   }

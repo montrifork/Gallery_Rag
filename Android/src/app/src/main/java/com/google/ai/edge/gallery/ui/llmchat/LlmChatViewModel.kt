@@ -40,6 +40,7 @@ import com.google.ai.edge.gallery.ui.common.chat.ChatViewModel
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.ToolProvider
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
@@ -252,7 +253,7 @@ open class LlmChatViewModelBase() : ChatViewModel() {
     Log.d(TAG, "Done stopping response")
   }
 
-  fun resetSession(
+  open fun resetSession(
     task: Task,
     model: Model,
     systemInstruction: Contents? = null,
@@ -313,7 +314,7 @@ open class LlmChatViewModelBase() : ChatViewModel() {
     }
   }
 
-  fun handleError(
+  open fun handleError(
     context: Context,
     task: Task,
     model: Model,
@@ -396,7 +397,51 @@ constructor(
   }
 
   fun clearRag() {
-    viewModelScope.launch { ragRepository.clear() }
+    viewModelScope.launch {
+      ragRepository.clear()
+    }
+  }
+
+  /**
+   * Per-model shadow history of CLEAN turns (user question + model answer) used to seed the
+   * underlying LiteRT-LM `Conversation` via `ConversationConfig.initialMessages` on every RAG
+   * turn. By "clean" we mean: the user message stored here is the original question WITHOUT the
+   * retrieved RAG context prefix. This lets the model retain conversational memory across turns
+   * while ensuring stale RAG prefixes never accumulate in the native KV cache.
+   *
+   * Cap on retained turns prevents unbounded prefill latency on very long sessions.
+   */
+  private val ragShadowHistory: MutableMap<String, MutableList<Message>> = mutableMapOf()
+
+  /**
+   * Drops the shadow history for [model]. Called when the engine has been (re)initialized or the
+   * user explicitly resets the session, so the next RAG turn starts from a clean slate.
+   */
+  fun clearRagShadowHistory(model: Model) {
+    synchronized(ragShadowHistory) { ragShadowHistory.remove(model.name) }
+  }
+
+  private fun shadowHistoryFor(model: Model): MutableList<Message> =
+    synchronized(ragShadowHistory) {
+      ragShadowHistory.getOrPut(model.name) { mutableListOf() }
+    }
+
+  private fun snapshotShadowHistory(model: Model): List<Message> =
+    synchronized(ragShadowHistory) {
+      ragShadowHistory[model.name]?.toList() ?: emptyList()
+    }
+
+  private fun appendShadowTurn(model: Model, userText: String, modelText: String) {
+    if (modelText.isEmpty()) return
+    val history = shadowHistoryFor(model)
+    synchronized(ragShadowHistory) {
+      history.add(Message.user(userText))
+      history.add(Message.model(modelText))
+      // Bound the history so prefill cost stays predictable.
+      while (history.size > MAX_SHADOW_MESSAGES) {
+        history.removeAt(0)
+      }
+    }
   }
 
   override fun generateResponse(
@@ -416,12 +461,59 @@ constructor(
       setInProgress(true)
       setPreparing(true)
       // Retrieval is suspending; do it in a coroutine then call super.
-      viewModelScope.launch {
+      viewModelScope.launch(Dispatchers.Default) {
         val scored = ragRepository.retrieve(input, k = 4)
         val prefix = ragRepository.formatContext(scored)
         val prefixed = if (prefix.isEmpty()) input else prefix + input
+
+        // CRITICAL: rebuild the underlying Conversation with only the CLEAN prior turns so the
+        // KV cache doesn't accumulate stale RAG prefixes from earlier turns. The model still
+        // "remembers" prior dialogue because those clean Q/A pairs are seeded via
+        // ConversationConfig.initialMessages. Only the *current* turn carries a RAG prefix.
+        val history = snapshotShadowHistory(model)
+        try {
+          model.runtimeHelper.rebuildConversationWithHistory(
+            model = model,
+            initialMessages = history,
+            supportImage = false,
+            supportAudio = false,
+            systemInstruction = null,
+            tools = emptyList(),
+            enableConversationConstrainedDecoding = false,
+          )
+        } catch (t: Throwable) {
+          Log.w(TAG, "rebuildConversationWithHistory failed; proceeding with existing session", t)
+        }
+
+        // Wrap onDone so we can capture the model's final answer text and append the CLEAN
+        // (un-prefixed) user turn + answer to the shadow history.
+        val wrappedOnDone: () -> Unit = {
+          try {
+            val last =
+              getLastMessageWithTypeAndSide(
+                model = model,
+                type = ChatMessageType.TEXT,
+                side = ChatSide.AGENT,
+              ) as? ChatMessageText
+            val answer = last?.content?.trim().orEmpty()
+            if (answer.isNotEmpty()) {
+              appendShadowTurn(model = model, userText = input, modelText = answer)
+            }
+          } catch (t: Throwable) {
+            Log.w(TAG, "Failed to capture answer for shadow history", t)
+          }
+          onDone()
+        }
+
         super@LlmChatViewModel.generateResponse(
-          model, prefixed, images, audioMessages, onFirstToken, onDone, onError, allowThinking
+          model,
+          prefixed,
+          images,
+          audioMessages,
+          onFirstToken,
+          wrappedOnDone,
+          onError,
+          allowThinking,
         )
       }
       return
@@ -432,8 +524,54 @@ constructor(
     )
   }
 
+  override fun resetSession(
+    task: Task,
+    model: Model,
+    systemInstruction: Contents?,
+    tools: List<ToolProvider>,
+    supportImage: Boolean,
+    supportAudio: Boolean,
+    onDone: () -> Unit,
+    enableConversationConstrainedDecoding: Boolean,
+  ) {
+    // Manual reset → also drop the shadow RAG history so the next RAG turn starts clean.
+    clearRagShadowHistory(model)
+    super.resetSession(
+      task = task,
+      model = model,
+      systemInstruction = systemInstruction,
+      tools = tools,
+      supportImage = supportImage,
+      supportAudio = supportAudio,
+      onDone = onDone,
+      enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+    )
+  }
+
+  override fun handleError(
+    context: Context,
+    task: Task,
+    model: Model,
+    modelManagerViewModel: ModelManagerViewModel,
+    errorMessage: String,
+  ) {
+    // Engine is about to be torn down + reinitialized; shadow history becomes stale.
+    clearRagShadowHistory(model)
+    super.handleError(
+      context = context,
+      task = task,
+      model = model,
+      modelManagerViewModel = modelManagerViewModel,
+      errorMessage = errorMessage,
+    )
+  }
+
   companion object {
     private const val DEFAULT_PDF_ASSET = "health_triage_kb.pdf"
+    // Keep at most this many messages (user + model entries) in the per-model shadow history
+    // used to seed `ConversationConfig.initialMessages`. With ~10 pairs at a few hundred tokens
+    // each, prefill stays well within a 32k context window.
+    private const val MAX_SHADOW_MESSAGES = 20
   }
 }
 
