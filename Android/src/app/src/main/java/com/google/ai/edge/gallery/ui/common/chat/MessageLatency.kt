@@ -39,6 +39,41 @@ fun LatencyText(message: ChatMessage) {
   }
 }
 
+/**
+ * Composable that displays the running context-token estimate for a chat message, if known
+ * ([ChatMessage.tokenCount] >= 0). The number shown is the estimated total number of tokens
+ * occupied in the LiteRT-LM conversation context at the moment this message becomes part of
+ * the prefill (i.e. system prompt + all prior retained turns + this message itself, plus the
+ * current RAG prefix for user turns when RAG is active).
+ */
+@Composable
+fun ContextTokenText(message: ChatMessage) {
+  if (message.tokenCount >= 0) {
+    Text(
+      "${message.tokenCount} ctx tok",
+      modifier = Modifier.alpha(0.5f).testTag("context_token_label"),
+      style = MaterialTheme.typography.labelSmall,
+    )
+  }
+}
+
+/**
+ * Composable that displays the process RAM usage (total PSS) sampled at the moment this
+ * message was stamped. Hidden when [ChatMessage.memoryBytes] is negative (unknown).
+ */
+@Composable
+fun MemoryText(message: ChatMessage) {
+  val bytes = message.memoryBytes
+  if (bytes >= 0L) {
+    val mb = bytes / (1024L * 1024L)
+    Text(
+      "$mb MB",
+      modifier = Modifier.alpha(0.5f).testTag("memory_label"),
+      style = MaterialTheme.typography.labelSmall,
+    )
+  }
+}
+
 // @Preview(showBackground = true)
 // @Composable
 // fun LatencyTextPreview() {

@@ -44,6 +44,8 @@ import com.google.ai.edge.gallery.data.Task
 import com.google.ai.edge.gallery.runtime.runtimeHelper
 import com.google.ai.edge.gallery.ui.theme.emptyStateContent
 import com.google.ai.edge.gallery.ui.theme.emptyStateTitle
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ExperimentalApi
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -71,6 +73,7 @@ class LlmChatTask @Inject constructor() : CustomTask {
       textInputPlaceHolderRes = R.string.text_input_placeholder_llm_chat,
     )
 
+  @OptIn(ExperimentalApi::class)
   override fun initializeModelFn(
     context: Context,
     coroutineScope: CoroutineScope,
@@ -83,6 +86,12 @@ class LlmChatTask @Inject constructor() : CustomTask {
       supportImage = false,
       supportAudio = false,
       onDone = onDone,
+      // Set the insurance-assistant system prompt at engine init so it is prefilled exactly
+      // once per Conversation. Non-RAG turns inherit this from the long-lived conversation;
+      // the RAG path passes the same constant when rebuilding the conversation. The prompt
+      // is NEVER appended to user messages or stored in the shadow history, so it cannot
+      // grow the context incrementally.
+      systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
       coroutineScope = coroutineScope,
     )
   }

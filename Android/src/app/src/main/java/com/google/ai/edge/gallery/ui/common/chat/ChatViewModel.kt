@@ -166,6 +166,10 @@ abstract class ChatViewModel() : ViewModel() {
             accelerator = lastMessage.accelerator,
             hideSenderLabel = lastMessage.hideSenderLabel,
           )
+        // Preserve the running context-token estimate and RAM sample across the streaming
+        // rebuild so the UI counters do not flicker / disappear between partial chunks.
+        newLastMessage.tokenCount = lastMessage.tokenCount
+        newLastMessage.memoryBytes = lastMessage.memoryBytes
         newMessages.removeAt(newMessages.size - 1)
         newMessages.add(newLastMessage)
       }

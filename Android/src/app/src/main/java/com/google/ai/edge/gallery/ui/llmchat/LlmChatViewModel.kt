@@ -16,9 +16,12 @@
 
 package com.google.ai.edge.gallery.ui.llmchat
 
+import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Debug
+import android.os.Process as AndroidProcess
 import android.util.Log
 import androidx.lifecycle.viewModelScope
 import com.google.ai.edge.gallery.data.ConfigKeys
@@ -43,6 +46,7 @@ import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.ToolProvider
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -52,6 +56,59 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 private const val TAG = "AGLlmChatViewModel"
+
+/**
+ * Fixed system instruction for the on-device insurance assistant. This string is passed to the
+ * LiteRT-LM engine via [com.google.ai.edge.litertlm.ConversationConfig.systemInstruction]. The
+ * engine prefills it ONCE per [com.google.ai.edge.litertlm.Conversation] construction; it is NOT
+ * re-sent or appended for every user turn within the same conversation, and it is NEVER stored
+ * in the shadow history that seeds rebuilt conversations as `initialMessages`. Net cost is a
+ * single fixed prefill (~340 tokens) per conversation creation — no incremental growth.
+ *
+ * ASCII-only by design; the prompt itself instructs the model to emit ASCII-only output.
+ *
+ * The prompt is structured as numbered, named rules to maximize per-rule salience on small
+ * instruction-tuned models like Gemma 3 / 3n / 4. Quote enforcement is paired with concrete
+ * good / bad examples because few-shot anchoring is dramatically more reliable than abstract
+ * rules for sub-4B parameter models. The quote rule is unconditional (not gated on "medical
+ * question") so the model does not need to classify the question first.
+ */
+const val LLM_CHAT_DEFAULT_SYSTEM_PROMPT: String =
+  "You are an on-device assistant for an insurance app. Answer the user's question using ONLY " +
+    "the knowledge base provided in the context preceding the user's question.\n" +
+    "\n" +
+    "OUTPUT RULES (follow ALL of them, every time):\n" +
+    "\n" +
+    "1. ASCII ONLY. No markdown, no bullets, no bold, no headings, no emoji, no smart quotes. " +
+    "Use only the ASCII double-quote character ( \" ) for quoting.\n" +
+    "\n" +
+    "2. QUOTE REQUIREMENT. Every answer, especially numbers or direct suggestions to the user, MUST include at least one verbatim excerpt copied " +
+    "character-for-character from the knowledge base, wrapped in ASCII double quotes. The " +
+    "excerpt must be 4 words or longer. Place the quote inline in your sentence, like this:\n" +
+    "   The policy states \"covered up to 30 days per year\" for inpatient stays.\n" +
+    "If you cannot find a suitable excerpt to quote, you do not have the answer (see rule 5).\n" +
+    "\n" +
+    "3. NUMBERS, DOSAGES, TIMEFRAMES. When the user asks about any number, dosage, percentage, " +
+    "age limit, waiting period, deductible, or timeframe, you MUST quote the exact phrase from " +
+    "the knowledge base that contains that number. Never restate numbers without a quote.\n" +
+    "\n" +
+    "4. CONCISENESS. 2 to 5 sentences. Do not add disclaimers, safety notes, or suggestions " +
+    "beyond what the knowledge base itself says. Do not invent medical or insurance facts.\n" +
+    "\n" +
+    "5. REFUSAL. If the knowledge base does not contain the answer, reply with this EXACT " +
+    "sentence and nothing else:\n" +
+    "   I do not have the knowledge to answer this question. Can you try to reformulate?\n" +
+    "\n" +
+    "EXAMPLES:\n" +
+    "\n" +
+    "User: How long is the waiting period for dental?\n" +
+    "Good: The plan specifies \"a waiting period of 6 months\" before dental benefits begin. " +
+    "Routine cleanings are covered after that.\n" +
+    "Bad (no quote, restated number): The waiting period is 6 months.\n" +
+    "Bad (paraphrased quote): The plan says there is a six-month waiting period.\n" +
+    "\n" +
+    "User: What is the capital of France?\n" +
+    "Good: I do not have the knowledge to answer this question. Can you try to reformulate?"
 
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
@@ -353,6 +410,7 @@ open class LlmChatViewModelBase() : ChatViewModel() {
 class LlmChatViewModel
 @Inject
 constructor(
+  @ApplicationContext private val appContext: Context,
   private val ragRepository: RagRepository,
   private val dataStoreRepository: DataStoreRepository,
 ) : LlmChatViewModelBase() {
@@ -444,6 +502,87 @@ constructor(
     }
   }
 
+  // --- Context-token bookkeeping for the in-UI counter ----------------------------------
+  //
+  // For the RAG path the underlying Conversation is rebuilt per turn, so the prefill is
+  // fully determined by what we pass as systemInstruction + initialMessages + the current
+  // turn's content. For the non-RAG path the Conversation persists and grows monotonically;
+  // we maintain a parallel running estimate per model so the UI can still show a number.
+  //
+  // All values are cheap heuristic estimates (1 token ≈ 4 chars, plus a few tokens of
+  // overhead per message for chat-template markers). This is intentionally approximate —
+  // the goal is to give the user a sense of how full the context is, not to be exact.
+
+  private val nonRagRunningTokens: MutableMap<String, Int> = mutableMapOf()
+
+  private fun resetNonRagRunningTokensFor(model: Model) {
+    synchronized(nonRagRunningTokens) { nonRagRunningTokens.remove(model.name) }
+  }
+
+  private fun estimateTextTokens(text: String): Int {
+    // ~4 chars/token for typical English; +4 for role/turn markers a chat template injects.
+    if (text.isEmpty()) return 0
+    return text.length / 4 + 4
+  }
+
+  private fun estimateMessageTokens(msg: Message): Int = estimateTextTokens(msg.toString())
+
+  /**
+   * Sums the prefill-time token cost of the persistent prompt + the supplied shadow history.
+   * Excludes the current turn's user input and RAG prefix — those are added separately by
+   * the caller depending on whether the turn went through the RAG branch.
+   */
+  private fun estimateBaseContextTokens(history: List<Message>): Int {
+    val systemTokens = estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
+    val historyTokens = history.sumOf { estimateMessageTokens(it) }
+    return systemTokens + historyTokens
+  }
+
+  /**
+   * Samples the current process's total PSS (proportional set size) in bytes. This is the
+   * most representative single number for "how much RAM is this app using right now" — it
+   * includes native mmap'd model weights (which `Runtime.totalMemory` would miss) and
+   * proportionally attributes shared pages.
+   *
+   * `getProcessMemoryInfo` can take 50–200 ms on some devices; callers must invoke this off
+   * the main thread. Returns `-1L` on failure.
+   */
+  private fun sampleProcessMemoryBytes(): Long {
+    return try {
+      val am = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        ?: return -1L
+      val infos = am.getProcessMemoryInfo(intArrayOf(AndroidProcess.myPid()))
+      if (infos.isNotEmpty()) {
+        infos[0].totalPss * 1024L
+      } else {
+        // Fallback: native heap size (cheap, no IPC).
+        Debug.getNativeHeapAllocatedSize()
+      }
+    } catch (t: Throwable) {
+      Log.w(TAG, "Failed to sample process memory", t)
+      -1L
+    }
+  }
+
+  /**
+   * Sets [ChatMessage.tokenCount] on the most-recent message of [side] and [type] for [model],
+   * replacing the message in the UI list so Compose recomposes. Falls back to a direct mutation
+   * + a no-op state replacement if no matching message is found.
+   */
+  private fun stampTokenCount(model: Model, side: ChatSide, type: ChatMessageType, count: Int) {
+    val target = getLastMessageWithTypeAndSide(model = model, type = type, side = side) ?: return
+    target.tokenCount = count
+    target.memoryBytes = sampleProcessMemoryBytes()
+    // Force a state-flow emission so Compose observes the mutation. The simplest way is to
+    // replace the message with itself in the list (the list reference changes via
+    // `replaceLastMessage` which already updates _uiState).
+    val last = getLastMessage(model = model)
+    if (last === target) {
+      replaceLastMessage(model = model, message = target, type = type)
+    }
+  }
+
+
   override fun generateResponse(
     model: Model,
     input: String,
@@ -477,13 +616,32 @@ constructor(
             initialMessages = history,
             supportImage = false,
             supportAudio = false,
-            systemInstruction = null,
+            systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
             tools = emptyList(),
             enableConversationConstrainedDecoding = false,
           )
         } catch (t: Throwable) {
           Log.w(TAG, "rebuildConversationWithHistory failed; proceeding with existing session", t)
         }
+
+        // Stamp the just-added USER message with the context-token count at send time:
+        //   system prompt + replayed shadow history + RAG prefix + user input.
+        // The RAG path rebuilds the Conversation, so this is the exact prefill size.
+        val userContextTokens =
+          estimateBaseContextTokens(history) +
+            estimateTextTokens(prefix) +
+            estimateTextTokens(input)
+        // Non-RAG running estimate should track the RAG rebuild as the new baseline, since
+        // a subsequent non-RAG turn would inherit the just-rebuilt conversation.
+        synchronized(nonRagRunningTokens) {
+          nonRagRunningTokens[model.name] = userContextTokens
+        }
+        stampTokenCount(
+          model = model,
+          side = ChatSide.USER,
+          type = ChatMessageType.TEXT,
+          count = userContextTokens,
+        )
 
         // Wrap onDone so we can capture the model's final answer text and append the CLEAN
         // (un-prefixed) user turn + answer to the shadow history.
@@ -499,6 +657,17 @@ constructor(
             if (answer.isNotEmpty()) {
               appendShadowTurn(model = model, userText = input, modelText = answer)
             }
+            // Agent-side context total = user-turn prefill + generated answer tokens.
+            val agentContextTokens = userContextTokens + estimateTextTokens(answer)
+            synchronized(nonRagRunningTokens) {
+              nonRagRunningTokens[model.name] = agentContextTokens
+            }
+            stampTokenCount(
+              model = model,
+              side = ChatSide.AGENT,
+              type = ChatMessageType.TEXT,
+              count = agentContextTokens,
+            )
           } catch (t: Throwable) {
             Log.w(TAG, "Failed to capture answer for shadow history", t)
           }
@@ -519,8 +688,56 @@ constructor(
       return
     }
 
+    // Non-RAG path: the Conversation persists across turns and grows monotonically. Update
+    // the running estimate to reflect this turn's user input now, and stamp the AGENT
+    // message after generation completes.
+    val baselineBeforeTurn =
+      synchronized(nonRagRunningTokens) {
+        // First non-RAG turn ever for this model: seed with just the system prompt cost.
+        nonRagRunningTokens[model.name] ?: estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
+      }
+    val userContextTokens = baselineBeforeTurn + estimateTextTokens(input)
+    synchronized(nonRagRunningTokens) {
+      nonRagRunningTokens[model.name] = userContextTokens
+    }
+    // Dispatch the stamp off the main thread because sampleProcessMemoryBytes() can take
+    // tens to hundreds of milliseconds on some devices (getProcessMemoryInfo is an IPC).
+    viewModelScope.launch(Dispatchers.Default) {
+      stampTokenCount(
+        model = model,
+        side = ChatSide.USER,
+        type = ChatMessageType.TEXT,
+        count = userContextTokens,
+      )
+    }
+
+    val wrappedOnDone: () -> Unit = {
+      try {
+        val last =
+          getLastMessageWithTypeAndSide(
+            model = model,
+            type = ChatMessageType.TEXT,
+            side = ChatSide.AGENT,
+          ) as? ChatMessageText
+        val answer = last?.content?.trim().orEmpty()
+        val agentContextTokens = userContextTokens + estimateTextTokens(answer)
+        synchronized(nonRagRunningTokens) {
+          nonRagRunningTokens[model.name] = agentContextTokens
+        }
+        stampTokenCount(
+          model = model,
+          side = ChatSide.AGENT,
+          type = ChatMessageType.TEXT,
+          count = agentContextTokens,
+        )
+      } catch (t: Throwable) {
+        Log.w(TAG, "Failed to stamp non-RAG agent token count", t)
+      }
+      onDone()
+    }
+
     super.generateResponse(
-      model, input, images, audioMessages, onFirstToken, onDone, onError, allowThinking
+      model, input, images, audioMessages, onFirstToken, wrappedOnDone, onError, allowThinking
     )
   }
 
@@ -536,10 +753,16 @@ constructor(
   ) {
     // Manual reset → also drop the shadow RAG history so the next RAG turn starts clean.
     clearRagShadowHistory(model)
+    resetNonRagRunningTokensFor(model)
+    // Ensure the default insurance-assistant system prompt is re-applied on reset. Callers
+    // (e.g. LlmChatScreen) don't supply one, so without this the post-reset conversation
+    // would have NO system instruction at all.
+    val effectiveSystemInstruction =
+      systemInstruction ?: Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
     super.resetSession(
       task = task,
       model = model,
-      systemInstruction = systemInstruction,
+      systemInstruction = effectiveSystemInstruction,
       tools = tools,
       supportImage = supportImage,
       supportAudio = supportAudio,
@@ -557,6 +780,7 @@ constructor(
   ) {
     // Engine is about to be torn down + reinitialized; shadow history becomes stale.
     clearRagShadowHistory(model)
+    resetNonRagRunningTokensFor(model)
     super.handleError(
       context = context,
       task = task,

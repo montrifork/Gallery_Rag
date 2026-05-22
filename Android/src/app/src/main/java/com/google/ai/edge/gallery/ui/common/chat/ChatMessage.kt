@@ -63,6 +63,24 @@ open class ChatMessage(
   open val hideSenderLabel: Boolean = false,
   open val disableBubbleShape: Boolean = false,
 ) {
+  /**
+   * Running estimate of the number of tokens that are (or would be) in the LiteRT-LM
+   * conversation context AT THE TIME THIS MESSAGE IS PART OF THE PREFILL. Computed in
+   * [com.google.ai.edge.gallery.ui.llmchat.LlmChatViewModel] only for the LLM Chat task.
+   * `-1` means "unknown / not applicable" and the UI will hide the counter.
+   *
+   * Mutable so the value can be set after the message has already been added to the UI
+   * (e.g. once the streamed answer is complete).
+   */
+  var tokenCount: Int = -1
+
+  /**
+   * Process RAM usage (total PSS in bytes) sampled at the moment this message was stamped.
+   * `-1L` means "unknown / not applicable" and the UI will hide the counter. Stamped by
+   * [com.google.ai.edge.gallery.ui.llmchat.LlmChatViewModel] only for the LLM Chat task.
+   */
+  var memoryBytes: Long = -1L
+
   open fun clone(): ChatMessage {
     return ChatMessage(
       type = type,
@@ -71,7 +89,10 @@ open class ChatMessage(
       accelerator = accelerator,
       hideSenderLabel = hideSenderLabel,
       disableBubbleShape = disableBubbleShape,
-    )
+    ).also {
+      it.tokenCount = tokenCount
+      it.memoryBytes = memoryBytes
+    }
   }
 }
 
@@ -135,7 +156,10 @@ open class ChatMessageText(
       llmBenchmarkResult = llmBenchmarkResult,
       hideSenderLabel = hideSenderLabel,
       data = data,
-    )
+    ).also {
+      it.tokenCount = tokenCount
+      it.memoryBytes = memoryBytes
+    }
   }
 }
 
