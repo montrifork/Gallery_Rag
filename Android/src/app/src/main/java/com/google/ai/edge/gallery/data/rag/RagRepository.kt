@@ -28,12 +28,12 @@ import kotlinx.serialization.json.Json
 /** Hilt-singleton repository owning the active RAG index. */
 interface RagRepository {
   val state: StateFlow<RagState>
-  suspend fun ingestPdf(uri: Uri): Result<Unit>
+  suspend fun ingestMarkdown(uri: Uri): Result<Unit>
 
   /**
-   * Ingests a PDF bundled in the app's assets. The display name shown to the user is
-   * [assetName] (e.g., "health_triage_kb.pdf"). Implementations copy the asset to a cache
-   * file and run the same indexing pipeline as [ingestPdf].
+   * Ingests a knowledge-base file bundled in the app's assets. The display name shown to the
+   * user is [assetName] (e.g., "health_triage_kb.md"). Implementations copy the asset to a
+   * cache file and run the same indexing pipeline as [ingestMarkdown].
    */
   suspend fun ingestAsset(assetName: String): Result<Unit>
 
@@ -46,7 +46,7 @@ interface RagRepository {
 
 class DefaultRagRepository(
   private val context: Context,
-  private val extractor: PdfTextExtractor,
+  private val extractor: MarkdownTextExtractor,
 ) : RagRepository {
 
   private val _state = MutableStateFlow<RagState>(RagState.Empty)
@@ -73,7 +73,7 @@ class DefaultRagRepository(
     }
   }
 
-  override suspend fun ingestPdf(uri: Uri): Result<Unit> = ingestInternal(uri, displayNameOverride = null)
+  override suspend fun ingestMarkdown(uri: Uri): Result<Unit> = ingestInternal(uri, displayNameOverride = null)
 
   override suspend fun ingestAsset(assetName: String): Result<Unit> {
     val cacheFile = try {
@@ -103,7 +103,7 @@ class DefaultRagRepository(
     try {
       _state.value = RagState.Indexing(0f)
 
-      val docName = displayNameOverride ?: queryDisplayName(uri) ?: "document.pdf"
+      val docName = displayNameOverride ?: queryDisplayName(uri) ?: "document.md"
 
       // Extract (0.0 -> 0.4)
       val pages = extractor.extract(uri)

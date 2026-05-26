@@ -47,6 +47,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.rounded.Refresh
@@ -124,13 +125,15 @@ fun ChatPanel(
   showStopButtonInInputWhenInProgress: Boolean = false,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
-  showPdfPicker: Boolean = false,
+  showMdPicker: Boolean = false,
   showRagToggle: Boolean = false,
   ragEnabled: Boolean = false,
   ragState: com.google.ai.edge.gallery.data.rag.RagState = com.google.ai.edge.gallery.data.rag.RagState.Empty,
-  onPickPdf: () -> Unit = {},
+  onPickMd: () -> Unit = {},
   onToggleRag: () -> Unit = {},
   onClearRag: () -> Unit = {},
+  showCopyContext: Boolean = false,
+  onCopyContext: (String) -> Unit = {},
   emptyStateComposable: @Composable (Model) -> Unit = {},
 ) {
   val uiState by viewModel.uiState.collectAsState()
@@ -482,6 +485,25 @@ fun ChatPanel(
                           },
                           enabled = !uiState.inProgress && message.content.isNotEmpty(),
                         )
+                        // Per-message "Copy context" button: copies the EXACT prompt the
+                        // engine received to produce THIS specific answer (RAG excerpts +
+                        // replayed history + wrapped user turn), captured at generation
+                        // time and stamped onto the message. Only shown for finished agent
+                        // responses that actually carry a snapshot.
+                        val snapshot = message.debugContextSnapshot
+                        if (snapshot != null) {
+                          MessageActionButton(
+                            label = "Copy context",
+                            icon = Icons.Outlined.BugReport,
+                            onClick = {
+                              clipboardManager.setText(AnnotatedString(snapshot))
+                              scope.launch {
+                                snackbarHostState.showSnackbar(copiedToClipboardLabel)
+                              }
+                            },
+                            enabled = !uiState.inProgress,
+                          )
+                        }
                       }
                     }
                   } else if (message.side == ChatSide.USER) {
@@ -624,13 +646,15 @@ fun ChatPanel(
         showSkillsPicker = task.id === BuiltInTaskId.LLM_AGENT_CHAT,
         showImagePicker = selectedModel.llmSupportImage && showImagePicker,
         showAudioPicker = selectedModel.llmSupportAudio && showAudioPicker,
-        showPdfPicker = showPdfPicker,
+        showMdPicker = showMdPicker,
         showRagToggle = showRagToggle,
         ragEnabled = ragEnabled,
         ragState = ragState,
-        onPickPdf = onPickPdf,
+        onPickMd = onPickMd,
         onToggleRag = onToggleRag,
         onClearRag = onClearRag,
+        showCopyContext = showCopyContext,
+        onCopyContext = onCopyContext,
         showStopButtonWhenInProgress = showStopButtonInInputWhenInProgress,
         onImageLimitExceeded = { showImageLimitBanner = true },
       )

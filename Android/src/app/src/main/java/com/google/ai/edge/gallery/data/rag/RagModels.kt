@@ -12,7 +12,12 @@ package com.google.ai.edge.gallery.data.rag
 
 import kotlinx.serialization.Serializable
 
-/** A single text chunk extracted from a PDF, with its page span and pre-tokenized terms. */
+/**
+ * A single text chunk extracted from a knowledge-base document, with the page span it covers
+ * and pre-tokenized terms. For markdown sources [pageStart] / [pageEnd] both default to `1`
+ * (the document is treated as a single synthetic page). Legacy PDF-derived indices still load
+ * fine because the schema is unchanged.
+ */
 @Serializable
 data class RagChunk(
   val id: Int,
@@ -36,7 +41,10 @@ data class RagIndexData(
 /** A chunk plus its BM25 score for a given query. */
 data class ScoredChunk(val chunk: RagChunk, val score: Double)
 
-/** A page of raw text extracted from a PDF (1-indexed page number). */
+/**
+ * A page of raw text from a knowledge-base document (1-indexed). For markdown sources only
+ * a single [PageText] with `page = 1` is produced; for legacy PDF sources one per page.
+ */
 data class PageText(val page: Int, val text: String)
 
 /** Public state of the RAG repository. */
@@ -52,14 +60,14 @@ sealed class RagError(message: String, cause: Throwable? = null) : Exception(mes
   class FileOpenFailed(cause: Throwable) :
     RagError("Could not open the selected file.", cause)
 
-  class NotAPdf(cause: Throwable? = null) :
-    RagError("The selected file is not a valid PDF.", cause)
+  class NotAMarkdownFile(cause: Throwable? = null) :
+    RagError("The selected file is not a valid Markdown file.", cause)
 
   class NoTextExtracted :
-    RagError("No text could be extracted from this PDF (it may be a scanned image).")
+    RagError("No text could be extracted from this file.")
 
   class TooLarge(val pages: Int) :
-    RagError("This PDF is too large ($pages pages). Please choose one under 500 pages.")
+    RagError("This document is too large ($pages sections). Please choose a smaller one.")
 
   class IndexBuildFailed(cause: Throwable) :
     RagError("Failed to build the search index.", cause)

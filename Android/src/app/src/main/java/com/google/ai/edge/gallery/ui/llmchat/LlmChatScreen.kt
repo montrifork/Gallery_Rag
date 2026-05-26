@@ -34,11 +34,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -60,6 +64,9 @@ import com.google.ai.edge.gallery.ui.common.chat.SendMessageTrigger
 import com.google.ai.edge.gallery.ui.modelmanager.ModelManagerViewModel
 import com.google.ai.edge.gallery.ui.theme.emptyStateContent
 import com.google.ai.edge.gallery.ui.theme.emptyStateTitle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "AGLlmChatScreen"
 
@@ -102,7 +109,7 @@ fun LlmChatScreen(
     sendMessageTrigger = sendMessageTrigger,
     showImagePicker = showImagePicker,
     showAudioPicker = showAudioPicker,
-    showPdfPicker = true,
+    showMdPicker = true,
     showRagToggle = true,
     getActiveSkills = getActiveSkills,
   )
@@ -202,7 +209,7 @@ fun ChatViewWrapper(
   sendMessageTrigger: SendMessageTrigger? = null,
   showImagePicker: Boolean = false,
   showAudioPicker: Boolean = false,
-  showPdfPicker: Boolean = false,
+  showMdPicker: Boolean = false,
   showRagToggle: Boolean = false,
   getActiveSkills: () -> List<String> = { emptyList() },
 ) {
@@ -216,15 +223,19 @@ fun ChatViewWrapper(
   val ragState by ragStateFlow.collectAsStateWithLifecycle()
   val ragEnabled by ragEnabledFlow.collectAsStateWithLifecycle()
 
-  val pdfPicker = rememberLauncherForActivityResult(
+  val mdPicker = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocument()
   ) { uri: Uri? ->
     if (uri != null) {
-      llmVm?.ingestPdf(uri) { msg ->
+      llmVm?.ingestMarkdown(uri) { msg ->
         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
       }
     }
   }
+
+  val clipboardManager = LocalClipboardManager.current
+  val copyScope = rememberCoroutineScope()
+  val modelManagerUiState by modelManagerViewModel.uiState.collectAsState()
 
   ChatView(
     task = task,
@@ -336,12 +347,28 @@ fun ChatViewWrapper(
     onSystemPromptChanged = onSystemPromptChanged,
     sendMessageTrigger = sendMessageTrigger,
     showAudioPicker = showAudioPicker,
-    showPdfPicker = showPdfPicker,
+    showMdPicker = showMdPicker,
     showRagToggle = showRagToggle,
     ragEnabled = ragEnabled,
     ragState = ragState,
-    onPickPdf = { pdfPicker.launch(arrayOf("application/pdf")) },
+    onPickMd = { mdPicker.launch(arrayOf("text/markdown", "text/plain")) },
     onToggleRag = { llmVm?.setRagEnabled(!ragEnabled) },
     onClearRag = { llmVm?.clearRag() },
+    showCopyContext = llmVm != null,
+    onCopyContext = { curInput ->
+      val vm = llmVm ?: return@ChatView
+      val model = modelManagerUiState.selectedModel
+      copyScope.launch {
+        val snapshot = withContext(Dispatchers.Default) {
+          vm.snapshotContextForDebug(model = model, currentInput = curInput)
+        }
+        clipboardManager.setText(AnnotatedString(snapshot))
+        Toast.makeText(
+          context,
+          "Copied model context to clipboard (${snapshot.length} chars)",
+          Toast.LENGTH_SHORT,
+        ).show()
+      }
+    },
   )
 }

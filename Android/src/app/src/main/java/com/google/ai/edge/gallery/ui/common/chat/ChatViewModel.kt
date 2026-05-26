@@ -170,6 +170,8 @@ abstract class ChatViewModel() : ViewModel() {
         // rebuild so the UI counters do not flicker / disappear between partial chunks.
         newLastMessage.tokenCount = lastMessage.tokenCount
         newLastMessage.memoryBytes = lastMessage.memoryBytes
+        newLastMessage.debugContextSnapshot = lastMessage.debugContextSnapshot
+        newLastMessage.unverifiedNumberRanges = lastMessage.unverifiedNumberRanges
         newMessages.removeAt(newMessages.size - 1)
         newMessages.add(newLastMessage)
       }

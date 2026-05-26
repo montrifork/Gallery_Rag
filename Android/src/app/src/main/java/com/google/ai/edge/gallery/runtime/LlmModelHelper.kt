@@ -96,6 +96,7 @@ interface LlmModelHelper {
     systemInstruction: Contents? = null,
     tools: List<ToolProvider> = listOf(),
     enableConversationConstrainedDecoding: Boolean = false,
+    temperatureOverride: Float? = null,
   ) {
     resetConversation(
       model = model,

@@ -81,6 +81,16 @@ open class ChatMessage(
    */
   var memoryBytes: Long = -1L
 
+  /**
+   * Debug-only: the exact reconstructed model context (system prompt + replayed history +
+   * RAG excerpts + wrapped user_question) that was sent to the engine to produce THIS
+   * message. Populated by [com.google.ai.edge.gallery.ui.llmchat.LlmChatViewModel] for
+   * AGENT messages so users can copy the verbatim prompt for debugging. `null` means no
+   * snapshot was captured (e.g. non-chat tasks, or messages produced before this feature
+   * existed).
+   */
+  var debugContextSnapshot: String? = null
+
   open fun clone(): ChatMessage {
     return ChatMessage(
       type = type,
@@ -92,6 +102,7 @@ open class ChatMessage(
     ).also {
       it.tokenCount = tokenCount
       it.memoryBytes = memoryBytes
+      it.debugContextSnapshot = debugContextSnapshot
     }
   }
 }
@@ -146,6 +157,14 @@ open class ChatMessageText(
     accelerator = accelerator,
     hideSenderLabel = hideSenderLabel,
   ) {
+  /**
+   * Character ranges within [content] that contain numbers (integers or decimals) NOT
+   * present verbatim in the [debugContextSnapshot] (i.e. likely hallucinated values that
+   * the model invented rather than copied from a retrieved excerpt). Rendered with a red
+   * underline by [MessageBodyText] as a debug aid for the user.
+   */
+  var unverifiedNumberRanges: List<IntRange> = emptyList()
+
   override fun clone(): ChatMessageText {
     return ChatMessageText(
       content = content,
@@ -159,6 +178,8 @@ open class ChatMessageText(
     ).also {
       it.tokenCount = tokenCount
       it.memoryBytes = memoryBytes
+      it.debugContextSnapshot = debugContextSnapshot
+      it.unverifiedNumberRanges = unverifiedNumberRanges
     }
   }
 }

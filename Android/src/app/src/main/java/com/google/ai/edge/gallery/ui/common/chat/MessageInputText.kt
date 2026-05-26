@@ -68,7 +68,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.rounded.Send
-import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.Close
@@ -179,13 +180,15 @@ fun MessageInputText(
   showAudioPicker: Boolean = false,
   showStopButtonWhenInProgress: Boolean = false,
   onImageLimitExceeded: () -> Unit = {},
-  showPdfPicker: Boolean = false,
+  showMdPicker: Boolean = false,
   showRagToggle: Boolean = false,
   ragEnabled: Boolean = false,
   ragState: RagState = RagState.Empty,
-  onPickPdf: () -> Unit = {},
+  onPickMd: () -> Unit = {},
   onToggleRag: () -> Unit = {},
   onClearRag: () -> Unit = {},
+  showCopyContext: Boolean = false,
+  onCopyContext: (String) -> Unit = {},
 ) {
   val context = LocalContext.current
   val lifecycleOwner = LocalLifecycleOwner.current
@@ -368,8 +371,8 @@ fun MessageInputText(
       }
     }
 
-    // RAG active-document chip / "attach a PDF" hint.
-    if (showRagToggle || showPdfPicker) {
+    // RAG active-document chip / "attach a Markdown file" hint.
+    if (showRagToggle || showMdPicker) {
       val chipModifier = Modifier.padding(start = 8.dp, end = 8.dp, bottom = 4.dp)
       when (val s = ragState) {
         is RagState.Ready -> {
@@ -380,7 +383,7 @@ fun MessageInputText(
               IconButton(onClick = onClearRag) {
                 Icon(
                   imageVector = Icons.Rounded.Close,
-                  contentDescription = "Clear PDF",
+                  contentDescription = "Clear file",
                 )
               }
             },
@@ -404,8 +407,8 @@ fun MessageInputText(
         RagState.Empty -> {
           if (ragEnabled) {
             AssistChip(
-              onClick = onPickPdf,
-              label = { Text("Attach a PDF to use RAG") },
+              onClick = onPickMd,
+              label = { Text("Attach a Markdown file to use RAG") },
               modifier = chipModifier,
             )
           }
@@ -637,21 +640,21 @@ fun MessageInputText(
                         )
                       }
 
-                      // Attach PDF for RAG.
-                      if (showPdfPicker) {
+                      // Attach Markdown file for RAG.
+                      if (showMdPicker) {
                         DropdownMenuItem(
                           text = {
                             Row(
                               verticalAlignment = Alignment.CenterVertically,
                               horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                              Icon(Icons.Filled.PictureAsPdf, contentDescription = null)
-                              Text("Attach PDF (RAG)")
+                              Icon(Icons.Filled.Description, contentDescription = null)
+                              Text("Attach Markdown (RAG)")
                             }
                           },
                           onClick = {
                             showAddContentMenu = false
-                            onPickPdf()
+                            onPickMd()
                           },
                         )
                       }
@@ -672,6 +675,27 @@ fun MessageInputText(
                           showTextInputHistorySheet = true
                         },
                       )
+
+                      // Debug: copy the current model context to the clipboard. Exposes the
+                      // exact system prompt + replayed history + (if RAG on) retrieved excerpts
+                      // + wrapped user_question that the engine would receive on the next turn.
+                      if (showCopyContext) {
+                        DropdownMenuItem(
+                          text = {
+                            Row(
+                              verticalAlignment = Alignment.CenterVertically,
+                              horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                              Icon(Icons.Outlined.BugReport, contentDescription = null)
+                              Text("Copy model context (debug)")
+                            }
+                          },
+                          onClick = {
+                            showAddContentMenu = false
+                            onCopyContext(curMessage)
+                          },
+                        )
+                      }
                     }
                   }
 

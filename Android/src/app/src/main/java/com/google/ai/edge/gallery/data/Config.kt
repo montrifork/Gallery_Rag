@@ -234,13 +234,15 @@ fun createLlmChatConfigs(
     // a few clean conversational turns) but small enough that the LiteRT-LM engine's KV-cache
     // allocation does not OOM the device. Defaulting to the full advertised context window
     // (e.g. 32k for Gemma 3) triggered a low-memory kill cascade on real devices.
-    // Cap at 8000 tokens; power users can raise the slider up to `defaultMaxContextLength`.
+    // Slider default capped at 8000 (safe on tested devices); ceiling lifted to 10000 so
+    // power users can opt in to more headroom at the cost of ~500 MB extra KV-cache RAM.
     val sliderDefault = maxOf(defaultMaxToken, minOf(defaultMaxContextLength, 8000))
+    val sliderCeiling = minOf(defaultMaxContextLength, 10000)
     maxTokensConfig =
       NumberSliderConfig(
         key = ConfigKeys.MAX_TOKENS,
         sliderMin = 2000f,
-        sliderMax = defaultMaxContextLength.toFloat(),
+        sliderMax = sliderCeiling.toFloat(),
         defaultValue = sliderDefault.toFloat(),
         valueType = ValueType.INT,
       )

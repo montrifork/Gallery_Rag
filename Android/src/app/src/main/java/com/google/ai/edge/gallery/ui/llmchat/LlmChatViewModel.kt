@@ -74,41 +74,27 @@ private const val TAG = "AGLlmChatViewModel"
  * question") so the model does not need to classify the question first.
  */
 const val LLM_CHAT_DEFAULT_SYSTEM_PROMPT: String =
-  "You are an on-device assistant for an insurance app. Answer the user's question using ONLY " +
-    "the knowledge base provided in the context preceding the user's question.\n" +
+  "You are an on-device assistant. The user turn contains:\n" +
+    "- <knowledge_base source=\"...\"> with one or more <excerpt index=\"N\"> blocks " +
+    "(the only source of truth).\n" +
+    "- <user_question> with the question to answer.\n" +
     "\n" +
-    "OUTPUT RULES (follow ALL of them, every time):\n" +
-    "\n" +
-    "1. ASCII ONLY. No markdown, no bullets, no bold, no headings, no emoji, no smart quotes. " +
-    "Use only the ASCII double-quote character ( \" ) for quoting.\n" +
-    "\n" +
-    "2. QUOTE REQUIREMENT. Every answer, especially numbers or direct suggestions to the user, MUST include at least one verbatim excerpt copied " +
-    "character-for-character from the knowledge base, wrapped in ASCII double quotes. The " +
-    "excerpt must be 4 words or longer. Place the quote inline in your sentence, like this:\n" +
-    "   The policy states \"covered up to 30 days per year\" for inpatient stays.\n" +
-    "If you cannot find a suitable excerpt to quote, you do not have the answer (see rule 5).\n" +
-    "\n" +
-    "3. NUMBERS, DOSAGES, TIMEFRAMES. When the user asks about any number, dosage, percentage, " +
-    "age limit, waiting period, deductible, or timeframe, you MUST quote the exact phrase from " +
-    "the knowledge base that contains that number. Never restate numbers without a quote.\n" +
-    "\n" +
-    "4. CONCISENESS. 2 to 5 sentences. Do not add disclaimers, safety notes, or suggestions " +
-    "beyond what the knowledge base itself says. Do not invent medical or insurance facts.\n" +
-    "\n" +
-    "5. REFUSAL. If the knowledge base does not contain the answer, reply with this EXACT " +
-    "sentence and nothing else:\n" +
+    "Rules:\n" +
+    "1. Answer ONLY from <excerpt> content. Never use prior turns or outside knowledge as facts.\n" +
+    "2. ASCII only. No markdown, no emoji.\n" +
+    "3. For any number, dose, age, percentage, timeframe, or amount: copy the digits " +
+    "character-for-character from an <excerpt>, inside ASCII double quotes. Never restate, " +
+    "round, or paraphrase a number.\n" +
+    "4. 2-5 sentences. No disclaimers.\n" +
+    "5. If no <excerpt> answers the question, reply EXACTLY:\n" +
     "   I do not have the knowledge to answer this question. Can you try to reformulate?\n" +
+    "6. Never output the tag names themselves.\n" +
     "\n" +
-    "EXAMPLES:\n" +
-    "\n" +
-    "User: How long is the waiting period for dental?\n" +
-    "Good: The plan specifies \"a waiting period of 6 months\" before dental benefits begin. " +
-    "Routine cleanings are covered after that.\n" +
-    "Bad (no quote, restated number): The waiting period is 6 months.\n" +
-    "Bad (paraphrased quote): The plan says there is a six-month waiting period.\n" +
-    "\n" +
-    "User: What is the capital of France?\n" +
-    "Good: I do not have the knowledge to answer this question. Can you try to reformulate?"
+    "Example:\n" +
+    "<knowledge_base source=\"plan.md\"><excerpt index=\"1\">Dental benefits begin after a " +
+    "waiting period of 6 months.</excerpt></knowledge_base>\n" +
+    "<user_question>How long is the dental waiting period?</user_question>\n" +
+    "The plan states \"a waiting period of 6 months\" before dental benefits begin."
 
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
@@ -425,17 +411,19 @@ constructor(
     )
 
   init {
-    // Bootstrap the bundled default PDF on first ever launch so users have a working
-    // RAG demo without needing to attach anything. Idempotent across launches.
+    // Bootstrap the bundled default knowledge base on first ever launch so users have a
+    // working RAG demo without needing to attach anything. Idempotent across launches.
+    // NOTE: the DataStore key is historically named `defaultPdfIngested`; we keep that name
+    // to avoid a proto migration. Semantically it means "default KB ingested".
     if (!dataStoreRepository.getDefaultPdfIngested() && ragState.value is RagState.Empty) {
       viewModelScope.launch {
-        val result = ragRepository.ingestAsset(DEFAULT_PDF_ASSET)
+        val result = ragRepository.ingestAsset(DEFAULT_KB_ASSET)
         if (result.isSuccess) {
           dataStoreRepository.setDefaultPdfIngested(true)
-          // Auto-enable RAG so the default PDF is actually used until the user toggles it off.
+          // Auto-enable RAG so the default KB is actually used until the user toggles it off.
           dataStoreRepository.setRagEnabled(true)
         } else {
-          Log.w(TAG, "Failed to auto-ingest default PDF", result.exceptionOrNull())
+          Log.w(TAG, "Failed to auto-ingest default knowledge base", result.exceptionOrNull())
         }
       }
     }
@@ -445,11 +433,11 @@ constructor(
     dataStoreRepository.setRagEnabled(enabled)
   }
 
-  fun ingestPdf(uri: Uri, onError: (String) -> Unit = {}) {
+  fun ingestMarkdown(uri: Uri, onError: (String) -> Unit = {}) {
     viewModelScope.launch {
-      val result = ragRepository.ingestPdf(uri)
+      val result = ragRepository.ingestMarkdown(uri)
       result.exceptionOrNull()?.let { e ->
-        onError(e.message ?: "Failed to ingest PDF")
+        onError(e.message ?: "Failed to ingest Markdown file")
       }
     }
   }
@@ -502,6 +490,113 @@ constructor(
     }
   }
 
+  /**
+   * Pure formatter: given the exact pieces of a turn (already computed), produces the
+   * human-readable debug snapshot string. Used both at generation time (to stamp each AGENT
+   * message with what was actually sent) and by the live "Copy model context (debug)" menu
+   * action (to preview what would be sent on the next turn).
+   *
+   * Passing `rawHistorySize == trimmedHistory.size` and `rawPrefixChars == trimmedPrefix.length`
+   * is fine if the caller didn't track the pre-trim sizes — those lines will just say
+   * "N stored, N replayed".
+   */
+  private fun formatContextSnapshot(
+    model: Model,
+    ragOn: Boolean,
+    rawPrefix: String,
+    trimmedPrefix: String,
+    rawHistorySize: Int,
+    trimmedHistory: List<Message>,
+    finalContextTokens: Int,
+    didTrim: Boolean,
+    wrappedInput: String,
+  ): String {
+    val sb = StringBuilder()
+    sb.append("=== MODEL CONTEXT SNAPSHOT (debug) ===\n")
+    sb.append("Mode: ").append(if (ragOn) "RAG" else "non-RAG").append("\n")
+    sb.append("Hard cap (maxNumTokens): ").append(hardCapFor(model)).append("\n")
+    sb.append("Effective cap (cap - reserve): ")
+      .append(hardCapFor(model) - RESERVE_FOR_ANSWER).append("\n")
+    sb.append("Estimated prefill tokens (post-trim, +10% safety): ")
+      .append(finalContextTokens).append("\n")
+    sb.append("History: ").append(rawHistorySize)
+      .append(" stored, ").append(trimmedHistory.size).append(" replayed\n")
+    if (ragOn) {
+      sb.append("RAG prefix: ").append(rawPrefix.length)
+        .append(" raw chars, ").append(trimmedPrefix.length).append(" post-trim chars\n")
+    }
+    sb.append("Trimmer engaged: ").append(didTrim).append("\n")
+    sb.append("\n--- [1] SYSTEM INSTRUCTION (prefilled once per Conversation) ---\n")
+    sb.append(LLM_CHAT_DEFAULT_SYSTEM_PROMPT).append("\n")
+    sb.append("\n--- [2] REPLAYED HISTORY (")
+      .append(trimmedHistory.size).append(" messages, oldest first) ---\n")
+    if (trimmedHistory.isEmpty()) {
+      sb.append("(none)\n")
+    } else {
+      for ((i, msg) in trimmedHistory.withIndex()) {
+        sb.append("[").append(i).append("] ").append(msg.toString()).append("\n")
+      }
+    }
+    sb.append("\n--- [3] CURRENT USER TURN (sent as a single user message) ---\n")
+    if (ragOn) {
+      sb.append(trimmedPrefix)
+    }
+    sb.append(wrappedInput).append("\n")
+    sb.append("\n=== END SNAPSHOT ===\n")
+    return sb.toString()
+  }
+
+  /**
+   * Debug helper: returns a human-readable reconstruction of EXACTLY what the engine would
+   * receive as prefill on the next turn, given the current draft [currentInput]. This mirrors
+   * the real generation pipeline:
+   *
+   *   1. System instruction (always prefilled by the engine).
+   *   2. Replayed shadow history (post-trimmer; oldest-first, may be reduced by the budget).
+   *   3. If RAG is enabled and indexed: the retrieved <knowledge_base> block for the current
+   *      input.
+   *   4. The wrapped <user_question> carrying the current input.
+   *
+   * Suspending because RAG retrieval is suspending. Safe to call off the main thread.
+   * Pure-read — does not mutate any state, does not touch the engine, does not consume any
+   * shadow-history budget.
+   */
+  suspend fun snapshotContextForDebug(model: Model, currentInput: String): String {
+    val ragOn = ragEnabled.value && ragState.value is RagState.Ready
+    val rawPrefix: String =
+      if (ragOn) {
+        try {
+          val scored = ragRepository.retrieve(currentInput, k = 4)
+          ragRepository.formatContext(scored)
+        } catch (t: Throwable) {
+          Log.w(TAG, "snapshotContextForDebug: retrieval failed", t)
+          "(RAG retrieval failed: ${t.message})\n"
+        }
+      } else {
+        ""
+      }
+    val rawHistory = snapshotShadowHistory(model)
+    val budget =
+      computeTokenBudget(
+        model = model,
+        ragPrefix = rawPrefix,
+        userInput = currentInput,
+        history = rawHistory,
+      )
+    val wrappedInput = "<user_question>$currentInput</user_question>"
+    return formatContextSnapshot(
+      model = model,
+      ragOn = ragOn,
+      rawPrefix = rawPrefix,
+      trimmedPrefix = budget.trimmedPrefix,
+      rawHistorySize = rawHistory.size,
+      trimmedHistory = budget.trimmedHistory,
+      finalContextTokens = budget.finalContextTokens,
+      didTrim = budget.didTrim,
+      wrappedInput = wrappedInput,
+    )
+  }
+
   // --- Context-token bookkeeping for the in-UI counter ----------------------------------
   //
   // For the RAG path the underlying Conversation is rebuilt per turn, so the prefill is
@@ -536,6 +631,106 @@ constructor(
     val systemTokens = estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
     val historyTokens = history.sumOf { estimateMessageTokens(it) }
     return systemTokens + historyTokens
+  }
+
+  /** Multiplies an estimate by the safety factor, rounding up. */
+  private fun withSafetyFactor(tokens: Int): Int =
+    kotlin.math.ceil(tokens * TOKEN_ESTIMATE_SAFETY_FACTOR).toInt()
+
+  /**
+   * Returns the live hard token cap for [model], read from the per-model `maxNumTokens` config
+   * slider value. Keeps the trimmer in lockstep with whatever the user has selected.
+   */
+  private fun hardCapFor(model: Model): Int =
+    model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = 8000)
+
+  /**
+   * Result of a token-budget trim: what the caller should actually send to the engine.
+   * [finalContextTokens] is the post-safety-factor estimate suitable for UI display.
+   */
+  private data class BudgetResult(
+    val trimmedPrefix: String,
+    val trimmedHistory: List<Message>,
+    val finalContextTokens: Int,
+    val didTrim: Boolean,
+  )
+
+  /**
+   * Enforces the per-turn token budget: `hardCap - RESERVE_FOR_ANSWER` is the effective prefill
+   * ceiling. Trim priority (high to low): drop oldest shadow history → truncate RAG prefix from
+   * the tail → never touch user input or system prompt. Estimates use a 10% safety factor.
+   */
+  private fun computeTokenBudget(
+    model: Model,
+    ragPrefix: String,
+    userInput: String,
+    history: List<Message>,
+  ): BudgetResult {
+    val hardCap = hardCapFor(model)
+    val effectiveCap = hardCap - RESERVE_FOR_ANSWER
+
+    val systemTokens = withSafetyFactor(estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT))
+    val inputTokens = withSafetyFactor(estimateTextTokens(userInput))
+    var prefixTokens = withSafetyFactor(estimateTextTokens(ragPrefix))
+
+    var trimmedPrefix = ragPrefix
+    var didTrim = false
+
+    // Degenerate case: system + input alone overflow. Drop prefix and history entirely.
+    if (systemTokens + inputTokens >= effectiveCap) {
+      Log.w(
+        TAG,
+        "Token budget exhausted by system+input ($systemTokens + $inputTokens) under cap " +
+          "$effectiveCap; dropping RAG prefix and history",
+      )
+      return BudgetResult(
+        trimmedPrefix = "",
+        trimmedHistory = emptyList(),
+        finalContextTokens = systemTokens + inputTokens,
+        didTrim = true,
+      )
+    }
+
+    // If prefix alone doesn't fit, truncate it word-by-word from the tail.
+    if (systemTokens + inputTokens + prefixTokens > effectiveCap) {
+      val available = effectiveCap - systemTokens - inputTokens
+      // Convert token budget back to a character budget using the same heuristic (4 chars/tok,
+      // minus the +4 overhead and the safety factor) — be conservative.
+      val charBudget = ((available / TOKEN_ESTIMATE_SAFETY_FACTOR).toInt() - 4) * 4
+      trimmedPrefix = if (charBudget <= 0) "" else ragPrefix.take(charBudget)
+      prefixTokens = withSafetyFactor(estimateTextTokens(trimmedPrefix))
+      didTrim = true
+      Log.d(TAG, "Trimmed RAG prefix to fit budget: $charBudget chars, ~$prefixTokens tok")
+    }
+
+    // Fill remaining budget with shadow history, newest-first, preserving turn boundaries.
+    val remaining = effectiveCap - systemTokens - inputTokens - prefixTokens
+    val keptReversed = mutableListOf<Message>()
+    var runningHistoryTokens = 0
+    // Walk newest-first.
+    for (msg in history.asReversed()) {
+      val cost = withSafetyFactor(estimateMessageTokens(msg))
+      if (runningHistoryTokens + cost > remaining) break
+      keptReversed.add(msg)
+      runningHistoryTokens += cost
+    }
+    var kept = keptReversed.asReversed().toMutableList()
+
+    // Preserve turn boundaries: if the oldest kept message is a model reply, drop it so we
+    // don't start the replay with a stranded assistant turn.
+    if (kept.isNotEmpty() && kept.first().toString().contains("\"role\":\"model\"", ignoreCase = true)) {
+      kept.removeAt(0)
+    }
+
+    if (kept.size != history.size) didTrim = true
+
+    val finalTokens = systemTokens + inputTokens + prefixTokens + runningHistoryTokens
+    return BudgetResult(
+      trimmedPrefix = trimmedPrefix,
+      trimmedHistory = kept,
+      finalContextTokens = finalTokens,
+      didTrim = didTrim,
+    )
   }
 
   /**
@@ -582,6 +777,45 @@ constructor(
     }
   }
 
+  /**
+   * Attaches [snapshot] to the most-recent AGENT TEXT message so the UI's per-message
+   * "Copy context" button can retrieve the EXACT prompt that produced this answer. Captures
+   * the model's "what did you see?" provenance for debugging. Also computes
+   * [ChatMessageText.unverifiedNumberRanges] — numeric spans in the answer that do NOT
+   * appear verbatim in [snapshot] — for the red-underline render in MessageBodyText.
+   */
+  private fun stampDebugContextSnapshot(model: Model, snapshot: String) {
+    val target =
+      getLastMessageWithTypeAndSide(
+        model = model,
+        type = ChatMessageType.TEXT,
+        side = ChatSide.AGENT,
+      ) ?: return
+    target.debugContextSnapshot = snapshot
+    if (target is ChatMessageText) {
+      target.unverifiedNumberRanges = computeUnverifiedNumberRanges(target.content, snapshot)
+    }
+    val last = getLastMessage(model = model)
+    if (last === target) {
+      replaceLastMessage(model = model, message = target, type = ChatMessageType.TEXT)
+    }
+  }
+
+  /**
+   * Returns the character ranges in [answer] containing numbers (integers or decimals like
+   * "250", "12.5", "1,000") that do NOT appear verbatim as a token in [snapshot]. Strict
+   * string match — "250" does not match "250.0". Used to visually flag likely hallucinated
+   * numbers in the rendered agent reply.
+   */
+  private fun computeUnverifiedNumberRanges(answer: String, snapshot: String): List<IntRange> {
+    val numberRegex = Regex("""\b\d+(?:[.,]\d+)?\b""")
+    val ctxNumbers = numberRegex.findAll(snapshot).map { it.value }.toHashSet()
+    return numberRegex.findAll(answer)
+      .filter { it.value !in ctxNumbers }
+      .map { it.range }
+      .toList()
+  }
+
 
   override fun generateResponse(
     model: Model,
@@ -602,14 +836,41 @@ constructor(
       // Retrieval is suspending; do it in a coroutine then call super.
       viewModelScope.launch(Dispatchers.Default) {
         val scored = ragRepository.retrieve(input, k = 4)
-        val prefix = ragRepository.formatContext(scored)
-        val prefixed = if (prefix.isEmpty()) input else prefix + input
+        val rawPrefix = ragRepository.formatContext(scored)
+        val rawHistory = snapshotShadowHistory(model)
+
+        // Enforce the per-turn token budget BEFORE building the conversation. Trim order:
+        // shadow history (oldest first) → RAG prefix (tail) → never input or system prompt.
+        val budget =
+          computeTokenBudget(
+            model = model,
+            ragPrefix = rawPrefix,
+            userInput = input,
+            history = rawHistory,
+          )
+        if (budget.didTrim) {
+          Log.d(
+            TAG,
+            "Token-budget trimmer engaged for RAG turn: history ${rawHistory.size}→" +
+              "${budget.trimmedHistory.size}, prefix ${rawPrefix.length}→" +
+              "${budget.trimmedPrefix.length} chars",
+          )
+        }
+        val prefix = budget.trimmedPrefix
+        val history = budget.trimmedHistory
+        // Wrap the user's input in a <user_question> fence so the model can unambiguously
+        // distinguish the documentation region (inside <knowledge_base>) from the actual
+        // question. The system prompt documents both fences and instructs the model never to
+        // emit the tag names. This also makes the prompt tail (`</user_question>`) lexical
+        // rather than numeric, breaking the digit-bias degeneracy that can collapse Gemma
+        // sampling on number-dense KB content.
+        val wrappedQuestion = "<user_question>$input</user_question>"
+        val prefixed = if (prefix.isEmpty()) wrappedQuestion else prefix + wrappedQuestion
 
         // CRITICAL: rebuild the underlying Conversation with only the CLEAN prior turns so the
         // KV cache doesn't accumulate stale RAG prefixes from earlier turns. The model still
         // "remembers" prior dialogue because those clean Q/A pairs are seeded via
         // ConversationConfig.initialMessages. Only the *current* turn carries a RAG prefix.
-        val history = snapshotShadowHistory(model)
         try {
           model.runtimeHelper.rebuildConversationWithHistory(
             model = model,
@@ -618,19 +879,19 @@ constructor(
             supportAudio = false,
             systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
             tools = emptyList(),
-            enableConversationConstrainedDecoding = false,
+            // Constrained decoding enabled on the RAG path to reduce digit-loop
+            // degeneracy and tighten numeric copying fidelity from <excerpt> blocks.
+            enableConversationConstrainedDecoding = true,
+            // Force deterministic decoding (temp=0) for factual lookup; user-set
+            // temperature applies only to free-form (non-RAG) chat.
+            temperatureOverride = 0.0f,
           )
         } catch (t: Throwable) {
           Log.w(TAG, "rebuildConversationWithHistory failed; proceeding with existing session", t)
         }
 
-        // Stamp the just-added USER message with the context-token count at send time:
-        //   system prompt + replayed shadow history + RAG prefix + user input.
-        // The RAG path rebuilds the Conversation, so this is the exact prefill size.
-        val userContextTokens =
-          estimateBaseContextTokens(history) +
-            estimateTextTokens(prefix) +
-            estimateTextTokens(input)
+        // Stamp the just-added USER message with the post-trim total prefill cost.
+        val userContextTokens = budget.finalContextTokens
         // Non-RAG running estimate should track the RAG rebuild as the new baseline, since
         // a subsequent non-RAG turn would inherit the just-rebuilt conversation.
         synchronized(nonRagRunningTokens) {
@@ -645,6 +906,13 @@ constructor(
 
         // Wrap onDone so we can capture the model's final answer text and append the CLEAN
         // (un-prefixed) user turn + answer to the shadow history.
+        val ragRawPrefix = rawPrefix
+        val ragTrimmedPrefix = budget.trimmedPrefix
+        val ragRawHistorySize = rawHistory.size
+        val ragTrimmedHistory = budget.trimmedHistory
+        val ragFinalCtxTokens = budget.finalContextTokens
+        val ragDidTrim = budget.didTrim
+        val ragWrappedQuestion = wrappedQuestion
         val wrappedOnDone: () -> Unit = {
           try {
             val last =
@@ -662,6 +930,23 @@ constructor(
             synchronized(nonRagRunningTokens) {
               nonRagRunningTokens[model.name] = agentContextTokens
             }
+            // Capture the EXACT context that produced this answer so the user can copy it
+            // post-hoc for debugging. Built from the locals captured above — these reflect
+            // what was actually sent to the engine on THIS turn (retrieved excerpts, trimmed
+            // history, etc.), not a re-retrieval at copy time.
+            val snapshot =
+              formatContextSnapshot(
+                model = model,
+                ragOn = true,
+                rawPrefix = ragRawPrefix,
+                trimmedPrefix = ragTrimmedPrefix,
+                rawHistorySize = ragRawHistorySize,
+                trimmedHistory = ragTrimmedHistory,
+                finalContextTokens = ragFinalCtxTokens,
+                didTrim = ragDidTrim,
+                wrappedInput = ragWrappedQuestion,
+              )
+            stampDebugContextSnapshot(model = model, snapshot = snapshot)
             stampTokenCount(
               model = model,
               side = ChatSide.AGENT,
@@ -690,16 +975,55 @@ constructor(
 
     // Non-RAG path: the Conversation persists across turns and grows monotonically. Update
     // the running estimate to reflect this turn's user input now, and stamp the AGENT
-    // message after generation completes.
+    // message after generation completes. If the running estimate is approaching the live
+    // hard cap, transparently rebuild the conversation with a trimmed shadow history so
+    // the engine never sees more than the budget allows.
     val baselineBeforeTurn =
       synchronized(nonRagRunningTokens) {
         // First non-RAG turn ever for this model: seed with just the system prompt cost.
         nonRagRunningTokens[model.name] ?: estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
       }
-    val userContextTokens = baselineBeforeTurn + estimateTextTokens(input)
+    val projected = baselineBeforeTurn + estimateTextTokens(input)
+    val hardCap = hardCapFor(model)
+    val effectiveCap = hardCap - RESERVE_FOR_ANSWER
+
+    var userContextTokens = projected
+    if (withSafetyFactor(projected) > effectiveCap) {
+      // Synchronous rebuild on the calling thread is safe — rebuild closes the old
+      // conversation and creates a new one; the subsequent super.generateResponse will
+      // then send into the rebuilt conversation.
+      val rawHistory = snapshotShadowHistory(model)
+      val budget =
+        computeTokenBudget(
+          model = model,
+          ragPrefix = "",
+          userInput = input,
+          history = rawHistory,
+        )
+      Log.d(
+        TAG,
+        "Non-RAG token budget exceeded ($projected > $effectiveCap); rebuilding " +
+          "conversation with trimmed history (${rawHistory.size}→${budget.trimmedHistory.size})",
+      )
+      try {
+        model.runtimeHelper.rebuildConversationWithHistory(
+          model = model,
+          initialMessages = budget.trimmedHistory,
+          supportImage = false,
+          supportAudio = false,
+          systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
+          tools = emptyList(),
+          enableConversationConstrainedDecoding = false,
+        )
+        userContextTokens = budget.finalContextTokens
+      } catch (t: Throwable) {
+        Log.w(TAG, "Non-RAG rebuild failed; proceeding with existing session", t)
+      }
+    }
     synchronized(nonRagRunningTokens) {
       nonRagRunningTokens[model.name] = userContextTokens
     }
+    val finalUserContextTokens = userContextTokens
     // Dispatch the stamp off the main thread because sampleProcessMemoryBytes() can take
     // tens to hundreds of milliseconds on some devices (getProcessMemoryInfo is an IPC).
     viewModelScope.launch(Dispatchers.Default) {
@@ -707,9 +1031,29 @@ constructor(
         model = model,
         side = ChatSide.USER,
         type = ChatMessageType.TEXT,
-        count = userContextTokens,
+        count = finalUserContextTokens,
       )
     }
+
+    // Capture the EXACT context that will be sent on this non-RAG turn so we can stamp it
+    // onto the AGENT message when generation finishes. The engine's Conversation already
+    // holds (system + prior history); the current turn appends the wrapped input. If we
+    // rebuilt above, history reflects the trimmed set; otherwise it reflects everything in
+    // shadow history (which mirrors what the persistent Conversation has accumulated).
+    val nonRagHistoryForSnapshot = snapshotShadowHistory(model)
+    val nonRagWrappedQuestion = "<user_question>$input</user_question>"
+    val nonRagSnapshot =
+      formatContextSnapshot(
+        model = model,
+        ragOn = false,
+        rawPrefix = "",
+        trimmedPrefix = "",
+        rawHistorySize = nonRagHistoryForSnapshot.size,
+        trimmedHistory = nonRagHistoryForSnapshot,
+        finalContextTokens = finalUserContextTokens,
+        didTrim = withSafetyFactor(projected) > effectiveCap,
+        wrappedInput = nonRagWrappedQuestion,
+      )
 
     val wrappedOnDone: () -> Unit = {
       try {
@@ -720,10 +1064,15 @@ constructor(
             side = ChatSide.AGENT,
           ) as? ChatMessageText
         val answer = last?.content?.trim().orEmpty()
-        val agentContextTokens = userContextTokens + estimateTextTokens(answer)
+        val agentContextTokens = finalUserContextTokens + estimateTextTokens(answer)
         synchronized(nonRagRunningTokens) {
           nonRagRunningTokens[model.name] = agentContextTokens
         }
+        // Also append to shadow history so the next turn's budget check sees this exchange.
+        if (answer.isNotEmpty()) {
+          appendShadowTurn(model = model, userText = input, modelText = answer)
+        }
+        stampDebugContextSnapshot(model = model, snapshot = nonRagSnapshot)
         stampTokenCount(
           model = model,
           side = ChatSide.AGENT,
@@ -736,8 +1085,13 @@ constructor(
       onDone()
     }
 
+    // Symmetric with the RAG path: wrap the user input in <user_question> so the model sees
+    // a consistent structural envelope on every turn regardless of whether RAG fired. Shadow
+    // history is appended with the CLEAN (un-wrapped) input below so replayed turns don't
+    // accumulate nested fences.
+    val wrappedInput = "<user_question>$input</user_question>"
     super.generateResponse(
-      model, input, images, audioMessages, onFirstToken, wrappedOnDone, onError, allowThinking
+      model, wrappedInput, images, audioMessages, onFirstToken, wrappedOnDone, onError, allowThinking
     )
   }
 
@@ -791,11 +1145,18 @@ constructor(
   }
 
   companion object {
-    private const val DEFAULT_PDF_ASSET = "health_triage_kb.pdf"
-    // Keep at most this many messages (user + model entries) in the per-model shadow history
-    // used to seed `ConversationConfig.initialMessages`. With ~10 pairs at a few hundred tokens
-    // each, prefill stays well within a 32k context window.
-    private const val MAX_SHADOW_MESSAGES = 20
+    private const val DEFAULT_KB_ASSET = "health_triage_kb.md"
+    // Upper bound on the per-model shadow history (user + model entries). The token-budget
+    // trimmer enforces an additional cap based on the live `maxNumTokens` slider value, so
+    // in practice we keep up to this many messages but only the newest that fit are replayed
+    // on any given turn.
+    private const val MAX_SHADOW_MESSAGES = 50
+    // Tokens reserved for the model's generated answer (kept out of the prefill budget so
+    // the engine always has somewhere to write).
+    private const val RESERVE_FOR_ANSWER = 1024
+    // Multiplier applied to all token estimates to leave headroom against the heuristic's
+    // ~10% underestimate. Trimming happens 10% earlier than the strict cap suggests.
+    private const val TOKEN_ESTIMATE_SAFETY_FACTOR = 1.1
   }
 }
 

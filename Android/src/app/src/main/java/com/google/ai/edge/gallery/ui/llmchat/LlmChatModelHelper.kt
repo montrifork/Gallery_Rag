@@ -182,6 +182,7 @@ object LlmChatModelHelper : LlmModelHelper {
     systemInstruction: Contents?,
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
+    temperatureOverride: Float?,
   ) {
     rebuildConversationInternal(
       model = model,
@@ -191,6 +192,7 @@ object LlmChatModelHelper : LlmModelHelper {
       systemInstruction = systemInstruction,
       tools = tools,
       enableConversationConstrainedDecoding = enableConversationConstrainedDecoding,
+      temperatureOverride = temperatureOverride,
     )
   }
 
@@ -203,6 +205,7 @@ object LlmChatModelHelper : LlmModelHelper {
     systemInstruction: Contents?,
     tools: List<ToolProvider>,
     enableConversationConstrainedDecoding: Boolean,
+    temperatureOverride: Float? = null,
   ) {
     try {
       Log.d(
@@ -216,8 +219,14 @@ object LlmChatModelHelper : LlmModelHelper {
       val engine = instance.engine
       val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
       val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
+      // Temperature override forces deterministic decoding on factual-lookup turns
+      // (RAG path). When null, fall back to the user-configured slider value.
       val temperature =
-        model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
+        temperatureOverride
+          ?: model.getFloatConfigValue(
+            key = ConfigKeys.TEMPERATURE,
+            defaultValue = DEFAULT_TEMPERATURE,
+          )
       val shouldEnableImage = supportImage
       val shouldEnableAudio = supportAudio
       Log.d(TAG, "Enable image: $shouldEnableImage, enable audio: $shouldEnableAudio")
