@@ -165,6 +165,22 @@ open class ChatMessageText(
    */
   var unverifiedNumberRanges: List<IntRange> = emptyList()
 
+  /**
+   * The model's verbatim output BEFORE [N#] tag substitution. Stored so the
+   * debug-context-copy button can reproduce the engine's actual emission and so
+   * the verifier can re-check tag references without depending on the displayed
+   * content. Null when number-tagging was not applied (e.g. non-RAG turns).
+   */
+  var taggedContent: String? = null
+
+  /**
+   * Map from [N#] keys (e.g. "N1") to their original numeric strings (e.g. "250")
+   * for this turn. Used during streaming (to live-substitute partial tagged
+   * content) and by the verifier to detect invented tag references. Null when
+   * number-tagging was not applied.
+   */
+  var numberMap: Map<String, String>? = null
+
   override fun clone(): ChatMessageText {
     return ChatMessageText(
       content = content,
@@ -180,6 +196,8 @@ open class ChatMessageText(
       it.memoryBytes = memoryBytes
       it.debugContextSnapshot = debugContextSnapshot
       it.unverifiedNumberRanges = unverifiedNumberRanges
+      it.taggedContent = taggedContent
+      it.numberMap = numberMap
     }
   }
 }

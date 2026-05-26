@@ -52,6 +52,16 @@ abstract class ChatViewModel() : ViewModel() {
   private val _uiState = MutableStateFlow(createUiState())
   val uiState = _uiState.asStateFlow()
 
+  /**
+   * Per-model [N#] -> "real number" map for the IN-FLIGHT generation, populated by
+   * subclasses (notably the RAG-aware LlmChatViewModel) just before
+   * `super.generateResponse` is called and consumed by
+   * [updateLastTextMessageContentIncrementally] on the first streaming chunk.
+   * After consumption it is stored on the streaming AGENT message itself so
+   * subsequent chunks can untag without further VM-level state.
+   */
+  protected val pendingNumberMapByModel: MutableMap<String, Map<String, String>> = mutableMapOf()
+
   fun addMessage(model: Model, message: ChatMessage) {
     val newMessagesByModel = _uiState.value.messagesByModel.toMutableMap()
     val newMessages = newMessagesByModel[model.name]?.toMutableList() ?: mutableListOf()
@@ -157,10 +167,27 @@ abstract class ChatViewModel() : ViewModel() {
     if (newMessages.isNotEmpty()) {
       val lastMessage = newMessages.last()
       if (lastMessage is ChatMessageText) {
-        val newContent = processLlmResponse(response = "${lastMessage.content}${partialContent}")
+        // Resolve number-tagging context for this in-flight AGENT message:
+        // the RAG path stamps a fresh [N#] -> "real number" map in
+        // `pendingNumberMapByModel` before generation starts. The first chunk
+        // adopts that map onto the message; subsequent chunks read it back from
+        // the message itself.
+        val activeMap: Map<String, String>? =
+          lastMessage.numberMap ?: pendingNumberMapByModel.remove(model.name)
+        // Accumulate raw (tagged) content; this is what the model actually emitted.
+        // We then untag for display so the user reads real digits, never "[N#]" tokens.
+        // Because NumberTagger.untag only matches complete "[N\d+]" sequences, partial
+        // mid-stream emissions like "[N" stay literal until the closing bracket arrives
+        // in the next chunk — safe for live streaming.
+        val newTagged =
+          processLlmResponse(
+            response = "${lastMessage.taggedContent ?: lastMessage.content}${partialContent}"
+          )
+        val newDisplay =
+          com.google.ai.edge.gallery.data.rag.NumberTagger.untag(newTagged, activeMap)
         val newLastMessage =
           ChatMessageText(
-            content = newContent,
+            content = newDisplay,
             side = lastMessage.side,
             latencyMs = latencyMs,
             accelerator = lastMessage.accelerator,
@@ -172,6 +199,8 @@ abstract class ChatViewModel() : ViewModel() {
         newLastMessage.memoryBytes = lastMessage.memoryBytes
         newLastMessage.debugContextSnapshot = lastMessage.debugContextSnapshot
         newLastMessage.unverifiedNumberRanges = lastMessage.unverifiedNumberRanges
+        newLastMessage.taggedContent = if (activeMap != null) newTagged else null
+        newLastMessage.numberMap = activeMap
         newMessages.removeAt(newMessages.size - 1)
         newMessages.add(newLastMessage)
       }

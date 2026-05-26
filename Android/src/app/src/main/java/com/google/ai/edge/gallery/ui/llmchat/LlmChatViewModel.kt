@@ -28,6 +28,7 @@ import com.google.ai.edge.gallery.data.ConfigKeys
 import com.google.ai.edge.gallery.data.DataStoreRepository
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.data.Task
+import com.google.ai.edge.gallery.data.rag.NumberTagger
 import com.google.ai.edge.gallery.data.rag.RagRepository
 import com.google.ai.edge.gallery.data.rag.RagState
 import com.google.ai.edge.gallery.runtime.runtimeHelper
@@ -74,27 +75,41 @@ private const val TAG = "AGLlmChatViewModel"
  * question") so the model does not need to classify the question first.
  */
 const val LLM_CHAT_DEFAULT_SYSTEM_PROMPT: String =
-  "You are an on-device assistant. The user turn contains:\n" +
-    "- <knowledge_base source=\"...\"> with one or more <excerpt index=\"N\"> blocks " +
-    "(the only source of truth).\n" +
-    "- <user_question> with the question to answer.\n" +
+  "You are a medical assistant that answers the user's question.\n" +
     "\n" +
-    "Rules:\n" +
-    "1. Answer ONLY from <excerpt> content. Never use prior turns or outside knowledge as facts.\n" +
-    "2. ASCII only. No markdown, no emoji.\n" +
-    "3. For any number, dose, age, percentage, timeframe, or amount: copy the digits " +
-    "character-for-character from an <excerpt>, inside ASCII double quotes. Never restate, " +
-    "round, or paraphrase a number.\n" +
-    "4. 2-5 sentences. No disclaimers.\n" +
-    "5. If no <excerpt> answers the question, reply EXACTLY:\n" +
+    "Each user message ends with <user_question>...</user_question> containing the question.\n" +
+    "\n" +
+    "When the user message ALSO contains <knowledge_base> with <excerpt> blocks, those " +
+    "excerpts are your only source of facts (KB mode). Numbers inside excerpts have been " +
+    "replaced with one- or two-letter uppercase tags in square brackets like [A], [B], [AC]. " +
+    "The tags are opaque placeholders to copy; they do not mean \"first\" or \"option A\".\n" +
+    "\n" +
+    "When there is NO <knowledge_base>, answer normally from your training as a helpful " +
+    "assistant.\n" +
+    "\n" +
+    "YOU MUST:\n" +
+    "1. (KB mode) Include at least one span copied character-for-character from an " +
+    "<excerpt>, wrapped in straight ASCII double quotes \"...\". Do not alter words, tense, " +
+    "capitalization, punctuation, spacing, or tags inside a quotation. Never write raw " +
+    "digits in KB mode.\n" +
+    "2. (KB mode) If no <excerpt> answers the question, reply EXACTLY:\n" +
     "   I do not have the knowledge to answer this question. Can you try to reformulate?\n" +
-    "6. Never output the tag names themselves.\n" +
+    "3. Plain prose only. No markdown, no emoji, no XML.\n" +
     "\n" +
-    "Example:\n" +
+    "Format guidance:\n" +
+    "- Keep answers short: at most 3 quoted spans, total under 80 words.\n" +
+    "- Use a brief connective phrase (e.g. \"According to the plan,\") to introduce a quote.\n" +
+    "\n" +
+    "Example (KB mode, good):\n" +
     "<knowledge_base source=\"plan.md\"><excerpt index=\"1\">Dental benefits begin after a " +
-    "waiting period of 6 months.</excerpt></knowledge_base>\n" +
+    "waiting period of [A] months.</excerpt></knowledge_base>\n" +
     "<user_question>How long is the dental waiting period?</user_question>\n" +
-    "The plan states \"a waiting period of 6 months\" before dental benefits begin."
+    "According to the plan, \"Dental benefits begin after a waiting period of [A] months.\"\n" +
+    "\n" +
+    "Example (KB mode, BAD vs GOOD - do not paraphrase inside quotes):\n" +
+    "Source: <excerpt index=\"1\">The annual deductible is [B] dollars per member.</excerpt>\n" +
+    "Bad:  \"The deductible is [B] dollars.\"   (rewrites the excerpt; forbidden)\n" +
+    "Good: The plan states, \"The annual deductible is [B] dollars per member.\""
 
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
@@ -510,6 +525,9 @@ constructor(
     finalContextTokens: Int,
     didTrim: Boolean,
     wrappedInput: String,
+    numberMap: Map<String, String>? = null,
+    answerTagged: String? = null,
+    taggedExcerpts: String? = null,
   ): String {
     val sb = StringBuilder()
     sb.append("=== MODEL CONTEXT SNAPSHOT (debug) ===\n")
@@ -542,6 +560,39 @@ constructor(
       sb.append(trimmedPrefix)
     }
     sb.append(wrappedInput).append("\n")
+    if (numberMap != null && numberMap.isNotEmpty()) {
+      // Authoritative tag -> "real digit string" map for the in-flight turn. The model
+      // is instructed to copy these tags verbatim from <excerpt> blocks; the renderer
+      // then replaces each tag with its mapped value before display. Anything else the
+      // verifier sees in the answer (raw digits or unknown tags) is flagged.
+      sb.append("\n--- [4] NUMBER MAP (tag -> real value) ---\n")
+      // Iterate in insertion order — NumberTagger emits a LinkedHashMap so this matches
+      // the order tags appear in the retrieved context, which is also the order the
+      // model encounters them.
+      for ((tag, value) in numberMap) {
+        sb.append("[").append(tag).append("] -> \"").append(value).append("\"\n")
+      }
+    }
+    // Section [5]: per-quote verbatim audit. Lists every "..."-wrapped span the model
+    // emitted, with PASS/FAIL against the tagged excerpt corpus. Helps iterate on the
+    // verbatim contract: any FAIL indicates a paraphrased "quotation".
+    if (answerTagged != null && taggedExcerpts != null) {
+      val haystack = taggedExcerpts.replace(Regex("""\s+"""), " ")
+      val quotes = QUOTED_SPAN_REGEX.findAll(answerTagged).toList()
+      sb.append("\n--- [5] VERBATIM CHECK (")
+        .append(quotes.size).append(" quoted span(s)) ---\n")
+      if (quotes.isEmpty()) {
+        sb.append("(no quoted spans in answer)\n")
+      } else {
+        for ((i, q) in quotes.withIndex()) {
+          val needle = q.groupValues[1].replace(Regex("""\s+"""), " ").trim()
+          val pass = needle.isNotEmpty() && haystack.contains(needle)
+          sb.append("[").append(i).append("] ")
+            .append(if (pass) "PASS" else "FAIL")
+            .append(" \"").append(q.groupValues[1]).append("\"\n")
+        }
+      }
+    }
     sb.append("\n=== END SNAPSHOT ===\n")
     return sb.toString()
   }
@@ -781,10 +832,19 @@ constructor(
    * Attaches [snapshot] to the most-recent AGENT TEXT message so the UI's per-message
    * "Copy context" button can retrieve the EXACT prompt that produced this answer. Captures
    * the model's "what did you see?" provenance for debugging. Also computes
-   * [ChatMessageText.unverifiedNumberRanges] — numeric spans in the answer that do NOT
-   * appear verbatim in [snapshot] — for the red-underline render in MessageBodyText.
+   * [ChatMessageText.unverifiedNumberRanges] — numeric/tag/quote attribution failures in the
+   * answer — for the red-underline render in MessageBodyText.
+   *
+   * [taggedExcerpts] is the post-tag retrieved RAG context (i.e. what the model actually
+   * saw inside <knowledge_base>). When non-null, the verifier's verbatim-quote pass runs:
+   * any "..."-wrapped span in the model's emission that is NOT a literal substring of
+   * [taggedExcerpts] is flagged red as a non-verbatim paraphrase.
    */
-  private fun stampDebugContextSnapshot(model: Model, snapshot: String) {
+  private fun stampDebugContextSnapshot(
+    model: Model,
+    snapshot: String,
+    taggedExcerpts: String? = null,
+  ) {
     val target =
       getLastMessageWithTypeAndSide(
         model = model,
@@ -793,7 +853,14 @@ constructor(
       ) ?: return
     target.debugContextSnapshot = snapshot
     if (target is ChatMessageText) {
-      target.unverifiedNumberRanges = computeUnverifiedNumberRanges(target.content, snapshot)
+      target.unverifiedNumberRanges =
+        computeUnverifiedNumberRanges(
+          answerDisplay = target.content,
+          answerTagged = target.taggedContent,
+          numberMap = target.numberMap,
+          snapshot = snapshot,
+          taggedExcerpts = taggedExcerpts,
+        )
     }
     val last = getLastMessage(model = model)
     if (last === target) {
@@ -802,18 +869,171 @@ constructor(
   }
 
   /**
-   * Returns the character ranges in [answer] containing numbers (integers or decimals like
-   * "250", "12.5", "1,000") that do NOT appear verbatim as a token in [snapshot]. Strict
-   * string match — "250" does not match "250.0". Used to visually flag likely hallucinated
-   * numbers in the rendered agent reply.
+   * Tag-aware verifier. Flags four failure modes in the rendered AGENT message:
+   *
+   *   (a) A literal "[XY]" (recognized tag shape) survived untagging — the model invented a
+   *       tag that was not in the numberMap. Range is on the display string (which still
+   *       shows the literal tag).
+   *   (b) A raw digit span that does NOT correspond to any mapped value AND does not appear
+   *       verbatim in the snapshot — the model bypassed the tag protocol and wrote a number
+   *       from memory. The range is on the display string.
+   *   (c) A bracketed alphabetic run that is LONGER than the tag grammar allows (e.g.
+   *       `[ALFA]`, `[ALFAFA]`, `[AAA]`) AND is near-miss to a known tag key (edit distance
+   *       <= 2). Catches morphological deformations of opaque tags. Logged at WARN.
+   *   (d) A quoted span ("...") in the answer that is NOT a literal substring of the tagged
+   *       excerpt text. Catches paraphrased "quotations" — the model wrapped its own words
+   *       in quotes instead of copying. The comparison is in TAGGED form (digit positions in
+   *       both sides are replaced by tags), so a quoted span like "deductible is [B] dollars"
+   *       passes iff the same string occurs in the retrieved <excerpt> blocks.
+   *
+   * When [numberMap] is null we fall back to the legacy snapshot-only digit check.
    */
-  private fun computeUnverifiedNumberRanges(answer: String, snapshot: String): List<IntRange> {
-    val numberRegex = Regex("""\b\d+(?:[.,]\d+)?\b""")
-    val ctxNumbers = numberRegex.findAll(snapshot).map { it.value }.toHashSet()
-    return numberRegex.findAll(answer)
-      .filter { it.value !in ctxNumbers }
-      .map { it.range }
-      .toList()
+  private fun computeUnverifiedNumberRanges(
+    answerDisplay: String,
+    answerTagged: String?,
+    numberMap: Map<String, String>?,
+    snapshot: String,
+    taggedExcerpts: String? = null,
+  ): List<IntRange> {
+    val numberRegex = Regex("""\b\d{1,3}(?:[.,]\d{3})+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\b""")
+    val ranges = mutableListOf<IntRange>()
+    if (numberMap != null) {
+      // (a) Unknown tags that survived untag — they are literal "[XY]" in the display.
+      ranges += NumberTagger.unknownTagRangesIn(answerDisplay, numberMap)
+      // (b) Raw digit spans in the display. Each must equal some mapped value to be trusted.
+      val allowed = numberMap.values.toHashSet()
+      for (m in numberRegex.findAll(answerDisplay)) {
+        if (m.value !in allowed) ranges += m.range
+      }
+      // (c) Deformed-tag detection. Scan for ANY bracketed alphabetic run (broader than the
+      // strict TAG_REGEX) and treat it as a deformation when:
+      //   - the bracketed content is NOT itself a known key (would already be flagged in (a)
+      //     via unknownTagRangesIn for short ones; long ones aren't matched by TAG_REGEX at
+      //     all and would otherwise slip through silently);
+      //   - it is "close" to a known key by Levenshtein distance (<= 2) AND longer than that
+      //     key (deformations are typically inflations: ALFA -> ALFAFA, AB -> ABB).
+      // This is a diagnostic safety net; under the single-letter pool the rate should be ~0.
+      val deformedRegex = Regex("""\[([A-Za-z_]{1,16})]""")
+      val keys = numberMap.keys
+      for (m in deformedRegex.findAll(answerDisplay)) {
+        val content = m.groupValues[1]
+        if (content in keys) continue // exact known tag; not a deformation
+        // unknownTagRangesIn already flagged 1-2 uppercase letter cases; skip them here to
+        // avoid double-counting (the renderer dedups but the log would be noisy).
+        if (content.length <= 2 && content.all { it.isUpperCase() }) continue
+        val nearest =
+          keys
+            .map { k -> k to levenshtein(content.uppercase(), k) }
+            .filter { (k, d) -> d <= 2 && content.length > k.length }
+            .minByOrNull { it.second }
+        if (nearest != null) {
+          Log.w(
+            TAG,
+            "Possible tag deformation: [$content] -> nearest known [${nearest.first}] " +
+              "(edit distance ${nearest.second}). Flagging in display.",
+          )
+          ranges += m.range
+        }
+      }
+      // (d) Verbatim-quote check. Compare the model's TAGGED emission (what it actually
+      // produced, before untag) against the TAGGED excerpts. Tagged-vs-tagged comparison is
+      // the right level because: (i) the model only ever saw tagged text, so its "verbatim
+      // copy" target is the tagged form, and (ii) it avoids spurious matches after the digit
+      // substitution that would compare "6 months" in the answer against "[A] months" in the
+      // source.
+      if (taggedExcerpts != null && answerTagged != null) {
+        val nonVerbatim =
+          findNonVerbatimQuoteRanges(
+            answerTagged = answerTagged,
+            answerDisplay = answerDisplay,
+            taggedExcerpts = taggedExcerpts,
+            numberMap = numberMap,
+          )
+        if (nonVerbatim.isNotEmpty()) {
+          Log.w(
+            TAG,
+            "Non-verbatim quoted span(s) in answer: ${nonVerbatim.size}. " +
+              "See snapshot section [5] for details.",
+          )
+        }
+        ranges += nonVerbatim
+      }
+    } else {
+      // Legacy path: compare against snapshot text directly.
+      val ctxNumbers = numberRegex.findAll(snapshot).map { it.value }.toHashSet()
+      for (m in numberRegex.findAll(answerDisplay)) {
+        if (m.value !in ctxNumbers) ranges += m.range
+      }
+    }
+    // Sort + de-overlap so the renderer can apply spans without conflict.
+    return ranges.sortedBy { it.first }.distinct()
+  }
+
+  /**
+   * Quote-span regex: matches ASCII double-quoted spans, non-greedy, single-line. Excludes
+   * empty quotes ("") which the model occasionally emits as artifacts. The body group is
+   * what we compare against the excerpt text.
+   */
+  private val QUOTED_SPAN_REGEX = Regex("""\"([^\"\n]{1,400})\"""")
+
+  /**
+   * For each "..." span in [answerTagged], check if its body is a literal substring of
+   * [taggedExcerpts] (whitespace-normalized on both sides to tolerate excerpt line breaks
+   * the model collapsed). If not, locate the corresponding range in [answerDisplay] using
+   * the [numberMap] to untag the quote body, and return that range for red-underlining.
+   *
+   * Fallback: if the untagged quote can't be located in display (rare — would require the
+   * streaming untag and the verifier to disagree), search for the bare untagged body alone.
+   */
+  private fun findNonVerbatimQuoteRanges(
+    answerTagged: String,
+    answerDisplay: String,
+    taggedExcerpts: String,
+    numberMap: Map<String, String>,
+  ): List<IntRange> {
+    val flagged = mutableListOf<IntRange>()
+    val haystack = taggedExcerpts.replace(Regex("""\s+"""), " ")
+    for (m in QUOTED_SPAN_REGEX.findAll(answerTagged)) {
+      val body = m.groupValues[1]
+      val needle = body.replace(Regex("""\s+"""), " ").trim()
+      if (needle.isEmpty()) continue
+      if (haystack.contains(needle)) continue
+      // Not verbatim. Locate the same quote in the display string.
+      val untaggedBody = NumberTagger.untag(body, numberMap)
+      val displayQuote = "\"$untaggedBody\""
+      val displayIdx = answerDisplay.indexOf(displayQuote)
+      if (displayIdx >= 0) {
+        flagged += displayIdx until (displayIdx + displayQuote.length)
+      } else {
+        val bareIdx = answerDisplay.indexOf(untaggedBody)
+        if (bareIdx >= 0) flagged += bareIdx until (bareIdx + untaggedBody.length)
+      }
+    }
+    return flagged
+  }
+
+  /**
+   * Iterative Levenshtein distance for short strings (tag keys are 1-2 chars; suspected
+   * deformations are bounded to 16 by the caller's regex). O(|a|*|b|) time, single-row DP.
+   * Used only by the verifier's deformation pass; performance-insensitive.
+   */
+  private fun levenshtein(a: String, b: String): Int {
+    if (a == b) return 0
+    if (a.isEmpty()) return b.length
+    if (b.isEmpty()) return a.length
+    var prev = IntArray(b.length + 1) { it }
+    var curr = IntArray(b.length + 1)
+    for (i in 1..a.length) {
+      curr[0] = i
+      for (j in 1..b.length) {
+        val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+        curr[j] = minOf(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+      }
+      val tmp = prev
+      prev = curr
+      curr = tmp
+    }
+    return prev[b.length]
   }
 
 
@@ -836,7 +1056,17 @@ constructor(
       // Retrieval is suspending; do it in a coroutine then call super.
       viewModelScope.launch(Dispatchers.Default) {
         val scored = ragRepository.retrieve(input, k = 4)
-        val rawPrefix = ragRepository.formatContext(scored)
+        val untaggedPrefix = ragRepository.formatContext(scored)
+        // Replace every digit span in the retrieved context with [N#] tags so the model
+        // performs a copy task (lexical island) rather than a recall task (digit-token
+        // confusion under int4 quantization). The map is consumed by the streaming
+        // pipeline and the verifier; the user-facing answer is untagged before display.
+        val tagged = NumberTagger.tag(untaggedPrefix)
+        val rawPrefix = tagged.text
+        val numberMap = tagged.numberMap
+        // Hand the map off to the streaming pipeline (consumed on the first chunk that
+        // arrives at updateLastTextMessageContentIncrementally for this model).
+        pendingNumberMapByModel[model.name] = numberMap
         val rawHistory = snapshotShadowHistory(model)
 
         // Enforce the per-turn token budget BEFORE building the conversation. Trim order:
@@ -913,6 +1143,7 @@ constructor(
         val ragFinalCtxTokens = budget.finalContextTokens
         val ragDidTrim = budget.didTrim
         val ragWrappedQuestion = wrappedQuestion
+        val ragNumberMap = numberMap
         val wrappedOnDone: () -> Unit = {
           try {
             val last =
@@ -921,6 +1152,10 @@ constructor(
                 type = ChatMessageType.TEXT,
                 side = ChatSide.AGENT,
               ) as? ChatMessageText
+            // `last.content` is the untagged (display) form, produced incrementally by
+            // updateLastTextMessageContentIncrementally. Shadow history stores the
+            // user-visible answer so future turns see self-consistent digits — tags are
+            // per-turn ephemera and would be meaningless on the next retrieval.
             val answer = last?.content?.trim().orEmpty()
             if (answer.isNotEmpty()) {
               appendShadowTurn(model = model, userText = input, modelText = answer)
@@ -945,8 +1180,15 @@ constructor(
                 finalContextTokens = ragFinalCtxTokens,
                 didTrim = ragDidTrim,
                 wrappedInput = ragWrappedQuestion,
+                numberMap = ragNumberMap,
+                answerTagged = last?.taggedContent,
+                taggedExcerpts = ragRawPrefix,
               )
-            stampDebugContextSnapshot(model = model, snapshot = snapshot)
+            stampDebugContextSnapshot(
+              model = model,
+              snapshot = snapshot,
+              taggedExcerpts = ragRawPrefix,
+            )
             stampTokenCount(
               model = model,
               side = ChatSide.AGENT,
