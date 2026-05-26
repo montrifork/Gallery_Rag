@@ -1150,10 +1150,10 @@ constructor(
     // trimmer enforces an additional cap based on the live `maxNumTokens` slider value, so
     // in practice we keep up to this many messages but only the newest that fit are replayed
     // on any given turn.
-    private const val MAX_SHADOW_MESSAGES = 50
+    private const val MAX_SHADOW_MESSAGES = 10
     // Tokens reserved for the model's generated answer (kept out of the prefill budget so
     // the engine always has somewhere to write).
-    private const val RESERVE_FOR_ANSWER = 1024
+    private const val RESERVE_FOR_ANSWER = 512
     // Multiplier applied to all token estimates to leave headroom against the heuristic's
     // ~10% underestimate. Trimming happens 10% earlier than the strict cap suggests.
     private const val TOKEN_ESTIMATE_SAFETY_FACTOR = 1.1

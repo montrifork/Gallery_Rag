@@ -19,7 +19,7 @@ object ContextFormatter {
    * leaving room for a large shadow history and the user's input under the 10k context cap.
    * The token-budget trimmer in `LlmChatViewModel` may shrink the prefix further per-turn.
    */
-  private const val MAX_PREFIX_WORDS = 2500
+  private const val MAX_PREFIX_WORDS = 1500
 
   /**
    * Produces a prefix that wraps retrieved chunks in XML-style structural markers the model

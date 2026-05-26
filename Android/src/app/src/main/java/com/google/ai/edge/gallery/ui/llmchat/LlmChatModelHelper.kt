@@ -49,6 +49,10 @@ import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CoroutineScope
 
 private const val TAG = "AGLlmChatModelHelper"
+// Hard upper bound on Engine.initialize(maxNumTokens=...). Defends against persisted
+// MAX_TOKENS values from older app builds that allowed up to 10000 but caused OOM crashes
+// on 4B-class models. Kept in sync with the Config.kt slider ceiling.
+private const val MAX_TOKENS_HARD_CAP = 4000
 
 data class LlmModelInstance(val engine: Engine, var conversation: Conversation)
 
@@ -69,8 +73,14 @@ object LlmChatModelHelper : LlmModelHelper {
     coroutineScope: CoroutineScope?,
   ) {
     // Prepare options.
+    // Hard-clamp the persisted MAX_TOKENS at 4000 to guard against legacy settings carried
+    // over from older app versions (which allowed up to 10000). A larger value here makes
+    // Engine.initialize() pre-allocate a KV-cache big enough to trigger Android lmkd / GPU
+    // OOM on 4B-class models (notably Gemma E4B).
     val maxTokens =
-      model.getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)
+      model
+        .getIntConfigValue(key = ConfigKeys.MAX_TOKENS, defaultValue = DEFAULT_MAX_TOKEN)
+        .coerceAtMost(MAX_TOKENS_HARD_CAP)
     val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
     val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
     val temperature =

@@ -234,10 +234,11 @@ fun createLlmChatConfigs(
     // a few clean conversational turns) but small enough that the LiteRT-LM engine's KV-cache
     // allocation does not OOM the device. Defaulting to the full advertised context window
     // (e.g. 32k for Gemma 3) triggered a low-memory kill cascade on real devices.
-    // Slider default capped at 8000 (safe on tested devices); ceiling lifted to 10000 so
-    // power users can opt in to more headroom at the cost of ~500 MB extra KV-cache RAM.
-    val sliderDefault = maxOf(defaultMaxToken, minOf(defaultMaxContextLength, 8000))
-    val sliderCeiling = minOf(defaultMaxContextLength, 10000)
+    // Slider default and ceiling pinned at 4000 after Gemma E4B (~270 KB/token KV-cache)
+    // OOM-killed the process when allocating a larger cache. 4000 tokens ≈ 1.05 GB KV-cache
+    // for a 4B-class model, which fits alongside ~3 GB of weights on 8 GB devices.
+    val sliderDefault = maxOf(defaultMaxToken, minOf(defaultMaxContextLength, 4000))
+    val sliderCeiling = minOf(defaultMaxContextLength, 4000)
     maxTokensConfig =
       NumberSliderConfig(
         key = ConfigKeys.MAX_TOKENS,
