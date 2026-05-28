@@ -40,8 +40,9 @@ interface RagRepository {
   suspend fun clear()
   suspend fun retrieve(query: String, k: Int = 4): List<ScoredChunk>
 
-  /** Convenience: returns the prompt prefix for [chunks], using the active doc name. Empty string if no index. */
-  fun formatContext(chunks: List<ScoredChunk>): String
+  /** Convenience: returns the prompt prefix for [chunks], using the active doc name. Empty
+   * [ContextFormatter.FormattedContext] (text="" / no tags) if no index. */
+  fun formatContext(chunks: List<ScoredChunk>): ContextFormatter.FormattedContext
 }
 
 class DefaultRagRepository(
@@ -190,8 +191,9 @@ class DefaultRagRepository(
     }
   }
 
-  override fun formatContext(chunks: List<ScoredChunk>): String {
-    val docName = current?.docName ?: return ""
+  override fun formatContext(chunks: List<ScoredChunk>): ContextFormatter.FormattedContext {
+    val docName = current?.docName
+      ?: return ContextFormatter.FormattedContext("", emptySet(), emptyMap())
     return ContextFormatter.format(docName, chunks)
   }
 

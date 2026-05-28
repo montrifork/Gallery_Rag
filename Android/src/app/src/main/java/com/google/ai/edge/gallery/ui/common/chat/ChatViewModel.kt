@@ -53,14 +53,25 @@ abstract class ChatViewModel() : ViewModel() {
   val uiState = _uiState.asStateFlow()
 
   /**
-   * Per-model [N#] -> "real number" map for the IN-FLIGHT generation, populated by
-   * subclasses (notably the RAG-aware LlmChatViewModel) just before
-   * `super.generateResponse` is called and consumed by
-   * [updateLastTextMessageContentIncrementally] on the first streaming chunk.
-   * After consumption it is stored on the streaming AGENT message itself so
-   * subsequent chunks can untag without further VM-level state.
+   * Per-model ephemeral turn-scoped context that the RAG-aware subclass
+   * ([com.google.ai.edge.gallery.ui.llmchat.LlmChatViewModel]) populates just
+   * before `super.generateResponse` is called, and that
+   * [updateLastTextMessageContentIncrementally] consumes on the first streaming
+   * chunk. After consumption the contents are stamped onto the streaming AGENT
+   * message itself so subsequent chunks (and post-stream UI like the
+   * "tap citation" sheet) can access them without further VM-level state.
+   *
+   * Bundling [numberMap] and [excerptDetails] into one record keeps the two
+   * pieces of per-turn ephemera atomic: a turn either has both (RAG path) or
+   * neither (non-RAG path), and the first-chunk handover is a single map
+   * removal rather than two coordinated ones.
    */
-  protected val pendingNumberMapByModel: MutableMap<String, Map<String, String>> = mutableMapOf()
+  data class PendingTurnContext(
+    val numberMap: Map<String, String>,
+    val excerptDetails: Map<String, com.google.ai.edge.gallery.data.rag.ContextFormatter.ExcerptDetails>,
+  )
+
+  protected val pendingTurnContextByModel: MutableMap<String, PendingTurnContext> = mutableMapOf()
 
   fun addMessage(model: Model, message: ChatMessage) {
     val newMessagesByModel = _uiState.value.messagesByModel.toMutableMap()
@@ -167,13 +178,18 @@ abstract class ChatViewModel() : ViewModel() {
     if (newMessages.isNotEmpty()) {
       val lastMessage = newMessages.last()
       if (lastMessage is ChatMessageText) {
-        // Resolve number-tagging context for this in-flight AGENT message:
-        // the RAG path stamps a fresh [N#] -> "real number" map in
-        // `pendingNumberMapByModel` before generation starts. The first chunk
-        // adopts that map onto the message; subsequent chunks read it back from
-        // the message itself.
-        val activeMap: Map<String, String>? =
-          lastMessage.numberMap ?: pendingNumberMapByModel.remove(model.name)
+        // Resolve turn-scoped context (number tags + excerpt details) for this
+        // in-flight AGENT message. The RAG path stashes both in
+        // `pendingTurnContextByModel` before generation begins; on the first
+        // chunk we adopt them onto the message and clear the pending slot.
+        // Subsequent chunks read state back from the message itself.
+        val existingNumberMap = lastMessage.numberMap
+        val pending: PendingTurnContext? =
+          if (existingNumberMap == null) pendingTurnContextByModel.remove(model.name) else null
+        val activeMap: Map<String, String>? = existingNumberMap ?: pending?.numberMap
+        val activeExcerptDetails:
+          Map<String, com.google.ai.edge.gallery.data.rag.ContextFormatter.ExcerptDetails>? =
+          lastMessage.excerptDetails ?: pending?.excerptDetails
         // Accumulate raw (tagged) content; this is what the model actually emitted.
         // We then untag for display so the user reads real digits, never "[N#]" tokens.
         // Because NumberTagger.untag only matches complete "[N\d+]" sequences, partial
@@ -201,6 +217,7 @@ abstract class ChatViewModel() : ViewModel() {
         newLastMessage.unverifiedNumberRanges = lastMessage.unverifiedNumberRanges
         newLastMessage.taggedContent = if (activeMap != null) newTagged else null
         newLastMessage.numberMap = activeMap
+        newLastMessage.excerptDetails = activeExcerptDetails
         newMessages.removeAt(newMessages.size - 1)
         newMessages.add(newLastMessage)
       }

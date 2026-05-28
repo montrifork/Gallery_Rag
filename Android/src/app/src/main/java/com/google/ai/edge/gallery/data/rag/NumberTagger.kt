@@ -49,6 +49,13 @@ import android.util.Log
  * Beyond 702 the pool recycles deterministically (logged warning); collisions
  * would surface as duplicate map entries which the verifier would flag.
  *
+ * Reserved namespace: any tag whose FIRST letter is `X` is reserved for
+ * excerpt-identifier tags (see [ContextFormatter] / `[XA]`, `[XB]`, ...).
+ * Number-tag allocation skips those slots so that the streaming untag step
+ * — which only replaces tags present in `numberMap` — passes the excerpt
+ * tags through unchanged for the verifier and the on-screen citation.
+ * Effective number pool is therefore 26 + 26*26 - (1 + 26) = 675 slots.
+ *
  * Scope: only retrieved <excerpt> content is tagged. The user's question and
  * shadow history are left as-is. Tags are turn-scoped (numberMap is rebuilt
  * fresh per retrieval); the user-visible answer stored in shadow history is
@@ -79,13 +86,16 @@ object NumberTagger {
   val TAG_REGEX = Regex("""\[([A-Z]{1,2})]""")
 
   /** Capacity before deterministic recycling kicks in. */
-  private const val POOL_CAPACITY = 26 + 26 * 26 // 702
+  private const val POOL_CAPACITY = 25 + 25 * 26 // 675; X-prefixed tags excluded.
 
   /**
-   * Returns the i-th opaque tag word (no brackets).
-   *   i in [0, 26)        -> single letter   "A".."Z"
-   *   i in [26, 702)      -> two letters     "AA","AB",...,"ZZ"
-   *   i >= 702            -> recycled (mod 702), logged
+   * Returns the i-th opaque tag word (no brackets), skipping any tag whose
+   * first letter is `X` (reserved for excerpt-identifier tags). Effective
+   * usable capacity is 675 distinct tags before recycling.
+   *
+   *   i in [0, 25)        -> "A".."W", "Y", "Z"  (single letters minus 'X')
+   *   i in [25, 675)      -> "AA",..,"WZ", "YA",..,"ZZ"  (two letters, first != 'X')
+   *   i >= 675            -> recycled (mod 675), logged
    */
   private fun tagWord(i: Int): String {
     if (i >= POOL_CAPACITY) {
@@ -96,11 +106,14 @@ object NumberTagger {
       )
     }
     val idx = i % POOL_CAPACITY
-    if (idx < 26) {
-      return ('A' + idx).toString()
+    if (idx < 25) {
+      // Map 0..24 -> A..W (0..22), then Y (23), Z (24); skip X (would be 23 in raw order).
+      val rawSingle = if (idx < 23) idx else idx + 1 // shift past 'X'
+      return ('A' + rawSingle).toString()
     }
-    val twoIdx = idx - 26
-    val hi = ('A' + (twoIdx / 26))
+    val twoIdx = idx - 25
+    val hiRaw = twoIdx / 26
+    val hi = ('A' + if (hiRaw < 23) hiRaw else hiRaw + 1) // skip 'X' as first letter
     val lo = ('A' + (twoIdx % 26))
     return "$hi$lo"
   }

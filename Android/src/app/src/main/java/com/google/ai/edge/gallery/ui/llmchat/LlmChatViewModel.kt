@@ -75,41 +75,36 @@ private const val TAG = "AGLlmChatViewModel"
  * question") so the model does not need to classify the question first.
  */
 const val LLM_CHAT_DEFAULT_SYSTEM_PROMPT: String =
-  "You are a medical assistant that answers the user's question.\n" +
+    "You are a medical assistant that answers the user's questions.\n" +
+    "You are given a context containing the following elements:\n" +
+    "   <user_question>...</user_question> (contains the user's question).\n" +
+    "   <knowledge_base>...</knowledge_base> (contains your medical knowledge base, also known as documentation).\n" +
+    "   <excerpt>...</excerpt> (contains excerpts from the knowledge base). Each excerpt is divided into individual sentences wrapped in <s tag=\"[X??]\">...</s> elements. Each sentence tag is a three-letter code like [XAA], [XAB], [XBC] — the first letter is always X, the second identifies the excerpt, and the third identifies the sentence within that excerpt.\n" +
+    "Numbers inside excerpts have been replaced with one- or two-letter uppercase tags in square brackets like [A], [B], [AC]. " +
+    "Both kinds of tags ([A]/[B] for numbers, [XAA]/[XAB] for sentences) are opaque placeholders to copy character-for-character; they do not mean \"first\" or \"option A\".\n" +
     "\n" +
-    "Each user message ends with <user_question>...</user_question> containing the question.\n" +
-    "\n" +
-    "When the user message ALSO contains <knowledge_base> with <excerpt> blocks, those " +
-    "excerpts are your only source of facts (KB mode). Numbers inside excerpts have been " +
-    "replaced with one- or two-letter uppercase tags in square brackets like [A], [B], [AC]. " +
-    "The tags are opaque placeholders to copy; they do not mean \"first\" or \"option A\".\n" +
-    "\n" +
-    "When there is NO <knowledge_base>, answer normally from your training as a helpful " +
-    "assistant.\n" +
-    "\n" +
-    "YOU MUST:\n" +
-    "1. (KB mode) Include at least one span copied character-for-character from an " +
-    "<excerpt>, wrapped in straight ASCII double quotes \"...\". Do not alter words, tense, " +
-    "capitalization, punctuation, spacing, or tags inside a quotation. Never write raw " +
-    "digits in KB mode.\n" +
-    "2. (KB mode) If no <excerpt> answers the question, reply EXACTLY:\n" +
+    "YOU MUST obey the following rules (arranged by importance):\n" +
+    "1. After every factual sentence in your answer, cite the specific sentence you used by writing its <s> tag in square brackets, e.g. [XAB]. Use ONLY the tag values that appear on an <s tag=\"...\"> element in the knowledge base. NEVER invent or alter sentence tags. Every factual claim must end with exactly one sentence citation.\n" +
+    "2. If no <excerpt> answers the question, reply EXACTLY:\n" +
     "   I do not have the knowledge to answer this question. Can you try to reformulate?\n" +
     "3. Plain prose only. No markdown, no emoji, no XML.\n" +
     "\n" +
     "Format guidance:\n" +
-    "- Keep answers short: at most 3 quoted spans, total under 80 words.\n" +
-    "- Use a brief connective phrase (e.g. \"According to the plan,\") to introduce a quote.\n" +
+    "- Keep answers short: total under 80 words.\n" +
+    "- Copy number tags ([A], [B], ...) verbatim from the excerpt; do not convert them to digits yourself.\n" +
     "\n" +
-    "Example (KB mode, good):\n" +
-    "<knowledge_base source=\"plan.md\"><excerpt index=\"1\">Dental benefits begin after a " +
-    "waiting period of [A] months.</excerpt></knowledge_base>\n" +
+    "Example (GOOD):\n" +
+    "<knowledge_base source=\"plan.md\"><excerpt>\n" +
+    "<s tag=\"[XAA]\">Dental benefits begin after a waiting period of [A] months.</s>\n" +
+    "</excerpt></knowledge_base>\n" +
     "<user_question>How long is the dental waiting period?</user_question>\n" +
-    "According to the plan, \"Dental benefits begin after a waiting period of [A] months.\"\n" +
+    "The dental waiting period is [A] months. [XAA]\n" +
     "\n" +
-    "Example (KB mode, BAD vs GOOD - do not paraphrase inside quotes):\n" +
-    "Source: <excerpt index=\"1\">The annual deductible is [B] dollars per member.</excerpt>\n" +
-    "Bad:  \"The deductible is [B] dollars.\"   (rewrites the excerpt; forbidden)\n" +
-    "Good: The plan states, \"The annual deductible is [B] dollars per member.\""
+    "Example (BAD vs GOOD - cite only tags that exist):\n" +
+    "Source: <s tag=\"[XAA]\">The annual deductible is [B] dollars per member.</s>\n" +
+    "Bad:  The annual deductible is [B] dollars per member. [XA]    (chunk-level tag; forbidden — always use the <s> tag)\n" +
+    "Bad:  The annual deductible is [B] dollars per member. [XZZ]   (invented tag; forbidden)\n" +
+    "Good: The annual deductible is [B] dollars per member. [XAA]"
 
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
@@ -527,7 +522,7 @@ constructor(
     wrappedInput: String,
     numberMap: Map<String, String>? = null,
     answerTagged: String? = null,
-    taggedExcerpts: String? = null,
+    validExcerptTags: Set<String>? = null,
   ): String {
     val sb = StringBuilder()
     sb.append("=== MODEL CONTEXT SNAPSHOT (debug) ===\n")
@@ -573,23 +568,24 @@ constructor(
         sb.append("[").append(tag).append("] -> \"").append(value).append("\"\n")
       }
     }
-    // Section [5]: per-quote verbatim audit. Lists every "..."-wrapped span the model
-    // emitted, with PASS/FAIL against the tagged excerpt corpus. Helps iterate on the
-    // verbatim contract: any FAIL indicates a paraphrased "quotation".
-    if (answerTagged != null && taggedExcerpts != null) {
-      val haystack = taggedExcerpts.replace(Regex("""\s+"""), " ")
-      val quotes = QUOTED_SPAN_REGEX.findAll(answerTagged).toList()
-      sb.append("\n--- [5] VERBATIM CHECK (")
-        .append(quotes.size).append(" quoted span(s)) ---\n")
-      if (quotes.isEmpty()) {
-        sb.append("(no quoted spans in answer)\n")
+    // Section [5]: sentence-citation audit. Lists every [X??] citation the model emitted,
+    // with PASS/FAIL against the set of sentence tags actually present in the retrieved
+    // context. FAIL = invented sentence tag — the model is fabricating a source.
+    if (validExcerptTags != null && answerTagged != null) {
+      val citations = CITATION_REGEX.findAll(answerTagged).toList()
+      sb.append("\n--- [5] SENTENCE CITATION CHECK (")
+        .append(citations.size).append(" citation(s); valid sentence tags = ")
+        .append(validExcerptTags.joinToString(", "))
+        .append(") ---\n")
+      if (citations.isEmpty()) {
+        sb.append("(no excerpt citations in answer)\n")
       } else {
-        for ((i, q) in quotes.withIndex()) {
-          val needle = q.groupValues[1].replace(Regex("""\s+"""), " ").trim()
-          val pass = needle.isNotEmpty() && haystack.contains(needle)
+        for ((i, c) in citations.withIndex()) {
+          val cited = c.value // e.g. "[XA]"
+          val pass = cited in validExcerptTags
           sb.append("[").append(i).append("] ")
             .append(if (pass) "PASS" else "FAIL")
-            .append(" \"").append(q.groupValues[1]).append("\"\n")
+            .append(" ").append(cited).append("\n")
         }
       }
     }
@@ -618,7 +614,7 @@ constructor(
       if (ragOn) {
         try {
           val scored = ragRepository.retrieve(currentInput, k = 4)
-          ragRepository.formatContext(scored)
+          ragRepository.formatContext(scored).text
         } catch (t: Throwable) {
           Log.w(TAG, "snapshotContextForDebug: retrieval failed", t)
           "(RAG retrieval failed: ${t.message})\n"
@@ -832,18 +828,18 @@ constructor(
    * Attaches [snapshot] to the most-recent AGENT TEXT message so the UI's per-message
    * "Copy context" button can retrieve the EXACT prompt that produced this answer. Captures
    * the model's "what did you see?" provenance for debugging. Also computes
-   * [ChatMessageText.unverifiedNumberRanges] — numeric/tag/quote attribution failures in the
-   * answer — for the red-underline render in MessageBodyText.
+   * [ChatMessageText.unverifiedNumberRanges] — numeric/tag/citation attribution failures in
+   * the answer — for the red-underline render in MessageBodyText.
    *
-   * [taggedExcerpts] is the post-tag retrieved RAG context (i.e. what the model actually
-   * saw inside <knowledge_base>). When non-null, the verifier's verbatim-quote pass runs:
-   * any "..."-wrapped span in the model's emission that is NOT a literal substring of
-   * [taggedExcerpts] is flagged red as a non-verbatim paraphrase.
+   * [validExcerptTags] is the set of opaque excerpt-identifier tags actually present in the
+   * retrieved RAG context (e.g. `{"[XA]", "[XB]", "[XC]"}`). When non-null, the verifier's
+   * citation pass runs: any `[X?]`-shaped citation the model emitted that is NOT in this
+   * set is flagged red as an invented source reference.
    */
   private fun stampDebugContextSnapshot(
     model: Model,
     snapshot: String,
-    taggedExcerpts: String? = null,
+    validExcerptTags: Set<String>? = null,
   ) {
     val target =
       getLastMessageWithTypeAndSide(
@@ -859,7 +855,7 @@ constructor(
           answerTagged = target.taggedContent,
           numberMap = target.numberMap,
           snapshot = snapshot,
-          taggedExcerpts = taggedExcerpts,
+          validExcerptTags = validExcerptTags,
         )
     }
     val last = getLastMessage(model = model)
@@ -873,18 +869,18 @@ constructor(
    *
    *   (a) A literal "[XY]" (recognized tag shape) survived untagging — the model invented a
    *       tag that was not in the numberMap. Range is on the display string (which still
-   *       shows the literal tag).
+   *       shows the literal tag). Excerpt-identifier tags `[X?]` are excluded from this
+   *       check — they are intentionally pass-through (not in the numberMap) and are
+   *       validated separately by failure mode (d).
    *   (b) A raw digit span that does NOT correspond to any mapped value AND does not appear
    *       verbatim in the snapshot — the model bypassed the tag protocol and wrote a number
    *       from memory. The range is on the display string.
    *   (c) A bracketed alphabetic run that is LONGER than the tag grammar allows (e.g.
    *       `[ALFA]`, `[ALFAFA]`, `[AAA]`) AND is near-miss to a known tag key (edit distance
    *       <= 2). Catches morphological deformations of opaque tags. Logged at WARN.
-   *   (d) A quoted span ("...") in the answer that is NOT a literal substring of the tagged
-   *       excerpt text. Catches paraphrased "quotations" — the model wrapped its own words
-   *       in quotes instead of copying. The comparison is in TAGGED form (digit positions in
-   *       both sides are replaced by tags), so a quoted span like "deductible is [B] dollars"
-   *       passes iff the same string occurs in the retrieved <excerpt> blocks.
+   *   (d) An excerpt citation `[X?]` that is NOT in [validExcerptTags] — the model invented
+   *       a source reference. Range is on the tagged answer (citations are pass-through so
+   *       the same characters appear in both tagged and display forms).
    *
    * When [numberMap] is null we fall back to the legacy snapshot-only digit check.
    */
@@ -893,13 +889,18 @@ constructor(
     answerTagged: String?,
     numberMap: Map<String, String>?,
     snapshot: String,
-    taggedExcerpts: String? = null,
+    validExcerptTags: Set<String>? = null,
   ): List<IntRange> {
     val numberRegex = Regex("""\b\d{1,3}(?:[.,]\d{3})+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\b""")
     val ranges = mutableListOf<IntRange>()
     if (numberMap != null) {
       // (a) Unknown tags that survived untag — they are literal "[XY]" in the display.
-      ranges += NumberTagger.unknownTagRangesIn(answerDisplay, numberMap)
+      // Exclude excerpt-identifier tags [X?]: those are intentionally pass-through.
+      ranges +=
+        NumberTagger.unknownTagRangesIn(answerDisplay, numberMap).filter { r ->
+          val token = answerDisplay.substring(r)
+          !CITATION_REGEX.matches(token)
+        }
       // (b) Raw digit spans in the display. Each must equal some mapped value to be trusted.
       val allowed = numberMap.values.toHashSet()
       for (m in numberRegex.findAll(answerDisplay)) {
@@ -915,14 +916,21 @@ constructor(
       // This is a diagnostic safety net; under the single-letter pool the rate should be ~0.
       val deformedRegex = Regex("""\[([A-Za-z_]{1,16})]""")
       val keys = numberMap.keys
+      // Excerpt tag KEYS (without brackets) for the deformation-near-miss check; we don't
+      // want to flag e.g. [XA] as a deformation of number-tag [A].
+      val excerptKeys = validExcerptTags?.mapNotNull { tag ->
+        CITATION_REGEX.matchEntire(tag)?.groupValues?.get(1)
+      }?.toSet().orEmpty()
       for (m in deformedRegex.findAll(answerDisplay)) {
         val content = m.groupValues[1]
-        if (content in keys) continue // exact known tag; not a deformation
+        if (content in keys) continue // exact known number tag; not a deformation
+        if (content in excerptKeys) continue // exact known excerpt tag; not a deformation
         // unknownTagRangesIn already flagged 1-2 uppercase letter cases; skip them here to
         // avoid double-counting (the renderer dedups but the log would be noisy).
         if (content.length <= 2 && content.all { it.isUpperCase() }) continue
+        val candidates = keys + excerptKeys
         val nearest =
-          keys
+          candidates
             .map { k -> k to levenshtein(content.uppercase(), k) }
             .filter { (k, d) -> d <= 2 && content.length > k.length }
             .minByOrNull { it.second }
@@ -935,28 +943,25 @@ constructor(
           ranges += m.range
         }
       }
-      // (d) Verbatim-quote check. Compare the model's TAGGED emission (what it actually
-      // produced, before untag) against the TAGGED excerpts. Tagged-vs-tagged comparison is
-      // the right level because: (i) the model only ever saw tagged text, so its "verbatim
-      // copy" target is the tagged form, and (ii) it avoids spurious matches after the digit
-      // substitution that would compare "6 months" in the answer against "[A] months" in the
-      // source.
-      if (taggedExcerpts != null && answerTagged != null) {
-        val nonVerbatim =
-          findNonVerbatimQuoteRanges(
+      // (d) Sentence-citation validity check. Every [X??] in the tagged answer must be a
+      // member of validExcerptTags. Citations are pass-through (the untag step ignores
+      // [X??] tags because they are not in numberMap), so character offsets are identical
+      // in answerTagged and answerDisplay — we report ranges directly against the display.
+      if (validExcerptTags != null && answerTagged != null) {
+        val invalidCitations =
+          findInvalidCitationRanges(
             answerTagged = answerTagged,
             answerDisplay = answerDisplay,
-            taggedExcerpts = taggedExcerpts,
-            numberMap = numberMap,
+            validExcerptTags = validExcerptTags,
           )
-        if (nonVerbatim.isNotEmpty()) {
+        if (invalidCitations.isNotEmpty()) {
           Log.w(
             TAG,
-            "Non-verbatim quoted span(s) in answer: ${nonVerbatim.size}. " +
-              "See snapshot section [5] for details.",
+            "Invalid sentence citation(s) in answer: ${invalidCitations.size}. " +
+              "Valid tags were $validExcerptTags. See snapshot section [5].",
           )
         }
-        ranges += nonVerbatim
+        ranges += invalidCitations
       }
     } else {
       // Legacy path: compare against snapshot text directly.
@@ -970,43 +975,34 @@ constructor(
   }
 
   /**
-   * Quote-span regex: matches ASCII double-quoted spans, non-greedy, single-line. Excludes
-   * empty quotes ("") which the model occasionally emits as artifacts. The body group is
-   * what we compare against the excerpt text.
+   * Excerpt-citation regex: matches the canonical `[X??]` opaque sentence-level citation
+   * emitted by `ContextFormatter` on `<s tag="...">`. The two uppercase letters after `X`
+   * encode chunk (A-Z) + sentence (A-Z). The `X` prefix is reserved across the system
+   * (see [NumberTagger]) so this never collides with number tags.
    */
-  private val QUOTED_SPAN_REGEX = Regex("""\"([^\"\n]{1,400})\"""")
+  private val CITATION_REGEX = Regex("""\[(X[A-Z][A-Z])]""")
 
   /**
-   * For each "..." span in [answerTagged], check if its body is a literal substring of
-   * [taggedExcerpts] (whitespace-normalized on both sides to tolerate excerpt line breaks
-   * the model collapsed). If not, locate the corresponding range in [answerDisplay] using
-   * the [numberMap] to untag the quote body, and return that range for red-underlining.
-   *
-   * Fallback: if the untagged quote can't be located in display (rare — would require the
-   * streaming untag and the verifier to disagree), search for the bare untagged body alone.
+   * For each `[X??]` citation in [answerTagged], check membership in [validExcerptTags]; if
+   * not present, return the range in [answerDisplay] (which has identical offsets — excerpt
+   * tags are pass-through through the untag step).
    */
-  private fun findNonVerbatimQuoteRanges(
+  private fun findInvalidCitationRanges(
     answerTagged: String,
     answerDisplay: String,
-    taggedExcerpts: String,
-    numberMap: Map<String, String>,
+    validExcerptTags: Set<String>,
   ): List<IntRange> {
+    if (answerTagged.isEmpty()) return emptyList()
     val flagged = mutableListOf<IntRange>()
-    val haystack = taggedExcerpts.replace(Regex("""\s+"""), " ")
-    for (m in QUOTED_SPAN_REGEX.findAll(answerTagged)) {
-      val body = m.groupValues[1]
-      val needle = body.replace(Regex("""\s+"""), " ").trim()
-      if (needle.isEmpty()) continue
-      if (haystack.contains(needle)) continue
-      // Not verbatim. Locate the same quote in the display string.
-      val untaggedBody = NumberTagger.untag(body, numberMap)
-      val displayQuote = "\"$untaggedBody\""
-      val displayIdx = answerDisplay.indexOf(displayQuote)
-      if (displayIdx >= 0) {
-        flagged += displayIdx until (displayIdx + displayQuote.length)
-      } else {
-        val bareIdx = answerDisplay.indexOf(untaggedBody)
-        if (bareIdx >= 0) flagged += bareIdx until (bareIdx + untaggedBody.length)
+    // Offsets in tagged vs display are identical because [X?] citations are never replaced
+    // by the streaming untag step (they are not in numberMap). We still bounds-check
+    // against the display string defensively in case future logic diverges.
+    for (m in CITATION_REGEX.findAll(answerTagged)) {
+      if (m.value !in validExcerptTags) {
+        val end = (m.range.last + 1).coerceAtMost(answerDisplay.length)
+        if (m.range.first < answerDisplay.length) {
+          flagged += m.range.first until end
+        }
       }
     }
     return flagged
@@ -1056,7 +1052,9 @@ constructor(
       // Retrieval is suspending; do it in a coroutine then call super.
       viewModelScope.launch(Dispatchers.Default) {
         val scored = ragRepository.retrieve(input, k = 4)
-        val untaggedPrefix = ragRepository.formatContext(scored)
+        val formatted = ragRepository.formatContext(scored)
+        val untaggedPrefix = formatted.text
+        val validExcerptTags = formatted.validExcerptTags
         // Replace every digit span in the retrieved context with [N#] tags so the model
         // performs a copy task (lexical island) rather than a recall task (digit-token
         // confusion under int4 quantization). The map is consumed by the streaming
@@ -1064,9 +1062,14 @@ constructor(
         val tagged = NumberTagger.tag(untaggedPrefix)
         val rawPrefix = tagged.text
         val numberMap = tagged.numberMap
-        // Hand the map off to the streaming pipeline (consumed on the first chunk that
-        // arrives at updateLastTextMessageContentIncrementally for this model).
-        pendingNumberMapByModel[model.name] = numberMap
+        // Hand the per-turn context (number map + excerpt details) off to the
+        // streaming pipeline (consumed on the first chunk that arrives at
+        // updateLastTextMessageContentIncrementally for this model).
+        pendingTurnContextByModel[model.name] =
+          PendingTurnContext(
+            numberMap = numberMap,
+            excerptDetails = formatted.detailsByTag,
+          )
         val rawHistory = snapshotShadowHistory(model)
 
         // Enforce the per-turn token budget BEFORE building the conversation. Trim order:
@@ -1144,6 +1147,7 @@ constructor(
         val ragDidTrim = budget.didTrim
         val ragWrappedQuestion = wrappedQuestion
         val ragNumberMap = numberMap
+        val ragValidExcerptTags = validExcerptTags
         val wrappedOnDone: () -> Unit = {
           try {
             val last =
@@ -1182,12 +1186,12 @@ constructor(
                 wrappedInput = ragWrappedQuestion,
                 numberMap = ragNumberMap,
                 answerTagged = last?.taggedContent,
-                taggedExcerpts = ragRawPrefix,
+                validExcerptTags = ragValidExcerptTags,
               )
             stampDebugContextSnapshot(
               model = model,
               snapshot = snapshot,
-              taggedExcerpts = ragRawPrefix,
+              validExcerptTags = ragValidExcerptTags,
             )
             stampTokenCount(
               model = model,

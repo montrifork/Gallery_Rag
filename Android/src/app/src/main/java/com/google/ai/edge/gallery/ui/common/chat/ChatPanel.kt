@@ -53,9 +53,11 @@ import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
@@ -189,6 +191,15 @@ fun ChatPanel(
   var pickedAudioClipsCount by remember { mutableIntStateOf(0) }
 
   var showImageLimitBanner by remember { mutableStateOf(false) }
+
+  // State for the excerpt-citation bottom sheet. Holds (message, tappedTag); null when
+  // the sheet is dismissed. We keep the originating message rather than just the
+  // ExcerptDetails so the sheet looks up details from the live message — surviving
+  // recompositions if the message object is replaced during streaming.
+  var citationSheetState by remember {
+    mutableStateOf<Pair<ChatMessageText, String>?>(null)
+  }
+  val citationSheetSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
   LaunchedEffect(showImageLimitBanner) {
     if (showImageLimitBanner) {
@@ -404,7 +415,11 @@ fun ChatPanel(
                     when (message) {
                       // Text
                       is ChatMessageText ->
-                        MessageBodyText(message = message, inProgress = uiState.inProgress)
+                        MessageBodyText(
+                          message = message,
+                          inProgress = uiState.inProgress,
+                          onCitationClick = { tag -> citationSheetState = message to tag },
+                        )
 
                       // Image
                       is ChatMessageImage -> {
@@ -678,6 +693,21 @@ fun ChatPanel(
         onBenchmarkClicked(selectedModel, message, warmUpIterations, benchmarkIterations)
       },
     )
+  }
+
+  // Excerpt-citation sheet. Resolves the tapped tag against the message's
+  // excerptDetails (which may be null for legacy/non-RAG messages — in which case the
+  // sheet shows a graceful fallback). The sheet is dismissable via swipe-down or
+  // tap-outside per ModalBottomSheet's defaults.
+  val sheetPayload = citationSheetState
+  if (sheetPayload != null) {
+    val (message, tag) = sheetPayload
+    ModalBottomSheet(
+      onDismissRequest = { citationSheetState = null },
+      sheetState = citationSheetSheetState,
+    ) {
+      CitationSheetContent(tag = tag, details = message.excerptDetails?.get(tag))
+    }
   }
 }
 

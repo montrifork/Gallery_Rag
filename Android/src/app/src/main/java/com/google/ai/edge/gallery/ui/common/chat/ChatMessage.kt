@@ -181,6 +181,15 @@ open class ChatMessageText(
    */
   var numberMap: Map<String, String>? = null
 
+  /**
+   * Map from excerpt-tag (e.g. "[XA]") to a structured description of the
+   * corresponding retrieved excerpt (digit-form body, source, page range).
+   * Populated for RAG turns; null otherwise. Consumed by the UI's
+   * tap-on-citation sheet to show the source the model claimed to cite.
+   */
+  var excerptDetails:
+    Map<String, com.google.ai.edge.gallery.data.rag.ContextFormatter.ExcerptDetails>? = null
+
   override fun clone(): ChatMessageText {
     return ChatMessageText(
       content = content,
@@ -198,6 +207,7 @@ open class ChatMessageText(
       it.unverifiedNumberRanges = unverifiedNumberRanges
       it.taggedContent = taggedContent
       it.numberMap = numberMap
+      it.excerptDetails = excerptDetails
     }
   }
 }
