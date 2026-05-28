@@ -91,7 +91,7 @@ class LlmChatTask @Inject constructor() : CustomTask {
       // the RAG path passes the same constant when rebuilding the conversation. The prompt
       // is NEVER appended to user messages or stored in the shadow history, so it cannot
       // grow the context incrementally.
-      systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
+      systemInstruction = Contents.of(selectSystemPromptFor(model)),
       coroutineScope = coroutineScope,
     )
   }

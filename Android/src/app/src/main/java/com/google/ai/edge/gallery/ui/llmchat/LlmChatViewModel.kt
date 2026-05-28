@@ -111,6 +111,55 @@ const val LLM_CHAT_DEFAULT_SYSTEM_PROMPT: String =
     "Bad:  \"The deductible is [B] dollars.\"   (rewrites the excerpt; forbidden)\n" +
     "Good: The plan states, \"The annual deductible is [B] dollars per member.\""
 
+/**
+ * Minimal fallback system prompt used for small (<2 GB) instruction-tuned models that
+ * cannot reliably follow the multi-rule, few-shot RAG prompt above. Models like
+ * Qwen 2.5 1.5B / DeepSeek-R1-Distill-Qwen-1.5B collapse into degenerate repetition
+ * loops when given a system prompt that consumes hundreds of tokens and imposes nested
+ * XML-tag / quoting conventions they have insufficient capacity to satisfy. Keep this
+ * string short and structurally simple.
+ */
+const val LLM_CHAT_SIMPLE_SYSTEM_PROMPT: String =
+  "You are a helpful assistant. Answer the user's question clearly and concisely."
+
+/**
+ * Minimal system prompt for small models when RAG context is available. Instructs the
+ * model to ground its answer in the provided context without imposing XML conventions
+ * or quoting rules that overwhelm sub-2B models.
+ */
+const val LLM_CHAT_SMALL_MODEL_RAG_PROMPT: String =
+  "Answer the question using only the provided context (the documentation). Be concise and ALWAYS QUOTE THE SOURCE OF YOUR INFORMATION. " +
+  "You must ALWAYS include a direct quote from the documentation, using quotation marks \"...\", in your response to medical questions." +
+  "For every medical answer you give MAKE SURE that the numbers and guidance you provide are correct. " +
+  "If you cannot find the answer to a medical question in the documentation, then you must reply with the following: 'I am sorry, but i do not know the answer to that.'."
+
+/**
+ * Models at or below this on-disk byte size are treated as "small" and receive
+ * [LLM_CHAT_SIMPLE_SYSTEM_PROMPT] instead of the full RAG-oriented
+ * [LLM_CHAT_DEFAULT_SYSTEM_PROMPT]. Threshold chosen to cover the q8 1.5B-parameter
+ * tier (Qwen 2.5 1.5B ≈ 1.6 GB, DeepSeek-R1-Distill-Qwen-1.5B ≈ 1.8 GB) while leaving
+ * the Gemma 3 / 3n / 4 families unaffected.
+ */
+internal const val SMALL_MODEL_THRESHOLD_BYTES: Long = 2_000_000_000L
+
+/**
+ * Returns the system prompt appropriate for [model]: the full structured prompt for
+ * mid-and-large models, or the minimal fallback for small models that degenerate under
+ * the larger prompt. See [SMALL_MODEL_THRESHOLD_BYTES] for the cutoff and
+ * [LLM_CHAT_SIMPLE_SYSTEM_PROMPT] for the rationale.
+ *
+ * Centralised so every call site (engine init, conversation rebuild, reset, and the
+ * non-RAG running-token accounting) stays in lockstep — a mismatch between the prompt
+ * actually sent and the prompt used for token estimation would invalidate the
+ * budget trimmer.
+ */
+fun selectSystemPromptFor(model: Model): String =
+  if (model.sizeInBytes in 1..SMALL_MODEL_THRESHOLD_BYTES) {
+    LLM_CHAT_SMALL_MODEL_RAG_PROMPT
+  } else {
+    LLM_CHAT_DEFAULT_SYSTEM_PROMPT
+  }
+
 @OptIn(ExperimentalApi::class)
 open class LlmChatViewModelBase() : ChatViewModel() {
   open fun generateResponse(
@@ -149,8 +198,17 @@ open class LlmChatViewModelBase() : ChatViewModel() {
       try {
         val resultListener: (String, Boolean, String?) -> Unit =
           { partialResult, done, partialThinkingResult ->
-            if (partialResult.startsWith("<ctrl")) {
-              // Do nothing. Ignore control tokens.
+            // Strip ChatML special tokens that LiteRT-LM may leak for Qwen / DeepSeek
+            // models. We strip rather than drop because the real answer content may be
+            // concatenated in the same chunk (e.g. "<|im_start|>assistant\nHello").
+            val cleaned = partialResult
+              .replace("<|im_start|>", "")
+              .replace("<|im_end|>", "")
+              .replace("<|endoftext|>", "")
+              .replace(Regex("^(system|user|assistant)\\n"), "")
+
+            if (cleaned.isEmpty() && !done || cleaned.startsWith("<ctrl")) {
+              // Pure control-token chunk or Gemma <ctrl…> token — skip.
             } else {
               // Remove the last message if it is a "loading" message.
               // This will only be done once.
@@ -224,10 +282,10 @@ open class LlmChatViewModelBase() : ChatViewModel() {
 
                 // Incrementally update the streamed partial results.
                 val latencyMs: Long = if (done) System.currentTimeMillis() - start else -1
-                if (partialResult.isNotEmpty() || wasLoading || done) {
+                if (cleaned.isNotEmpty() || wasLoading || done) {
                   updateLastTextMessageContentIncrementally(
                     model = model,
-                    partialContent = partialResult,
+                    partialContent = cleaned,
                     latencyMs = latencyMs.toFloat(),
                   )
                 }
@@ -545,7 +603,7 @@ constructor(
     }
     sb.append("Trimmer engaged: ").append(didTrim).append("\n")
     sb.append("\n--- [1] SYSTEM INSTRUCTION (prefilled once per Conversation) ---\n")
-    sb.append(LLM_CHAT_DEFAULT_SYSTEM_PROMPT).append("\n")
+    sb.append(selectSystemPromptFor(model)).append("\n")
     sb.append("\n--- [2] REPLAYED HISTORY (")
       .append(trimmedHistory.size).append(" messages, oldest first) ---\n")
     if (trimmedHistory.isEmpty()) {
@@ -678,8 +736,8 @@ constructor(
    * Excludes the current turn's user input and RAG prefix — those are added separately by
    * the caller depending on whether the turn went through the RAG branch.
    */
-  private fun estimateBaseContextTokens(history: List<Message>): Int {
-    val systemTokens = estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
+  private fun estimateBaseContextTokens(model: Model, history: List<Message>): Int {
+    val systemTokens = estimateTextTokens(selectSystemPromptFor(model))
     val historyTokens = history.sumOf { estimateMessageTokens(it) }
     return systemTokens + historyTokens
   }
@@ -720,7 +778,7 @@ constructor(
     val hardCap = hardCapFor(model)
     val effectiveCap = hardCap - RESERVE_FOR_ANSWER
 
-    val systemTokens = withSafetyFactor(estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT))
+    val systemTokens = withSafetyFactor(estimateTextTokens(selectSystemPromptFor(model)))
     val inputTokens = withSafetyFactor(estimateTextTokens(userInput))
     var prefixTokens = withSafetyFactor(estimateTextTokens(ragPrefix))
 
@@ -1048,6 +1106,51 @@ constructor(
     allowThinking: Boolean,
   ) {
     if (ragEnabled.value && ragState.value is RagState.Ready) {
+      val isSmallModel = model.sizeInBytes in 1..SMALL_MODEL_THRESHOLD_BYTES
+
+      if (isSmallModel) {
+        // Simplified RAG path for small models: plain-text context, no XML tags, no
+        // number tagging, no constrained decoding. The conversation is rebuilt fresh
+        // each turn to prevent KV cache accumulation that would exceed maxTokens
+        // after 2-3 turns (~1300 tokens of context per turn).
+        setInProgress(true)
+        setPreparing(true)
+        viewModelScope.launch(Dispatchers.Default) {
+          val scored = ragRepository.retrieve(input, k = 2)
+          val plainContext = scored.joinToString("\n\n") { it.chunk.text }
+          val prefixed = "Context:\n$plainContext\n\nQuestion: $input"
+
+          // Rebuild conversation fresh so each RAG turn starts with a clean KV cache.
+          // No initialMessages — each turn is stateless for small models.
+          try {
+            model.runtimeHelper.rebuildConversationWithHistory(
+              model = model,
+              initialMessages = emptyList(),
+              supportImage = false,
+              supportAudio = false,
+              systemInstruction = Contents.of(LLM_CHAT_SMALL_MODEL_RAG_PROMPT),
+              tools = emptyList(),
+              enableConversationConstrainedDecoding = false,
+            )
+          } catch (t: Throwable) {
+            Log.w(TAG, "Small-model RAG rebuild failed", t)
+          }
+
+          super@LlmChatViewModel.generateResponse(
+            model,
+            prefixed,
+            images,
+            audioMessages,
+            onFirstToken,
+            onDone,
+            onError,
+            allowThinking,
+          )
+        }
+        return
+      }
+
+      // Full RAG path for large models (Gemma 3/4 etc.) — unchanged.
       // Set busy flags synchronously so a fast double-tap on send is gated immediately,
       // even though retrieval and the actual super-call happen asynchronously below.
       // super.generateResponse will call setInProgress(true)/setPreparing(true) again — these are idempotent.
@@ -1107,7 +1210,7 @@ constructor(
             initialMessages = history,
             supportImage = false,
             supportAudio = false,
-            systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
+            systemInstruction = Contents.of(selectSystemPromptFor(model)),
             tools = emptyList(),
             // Constrained decoding enabled on the RAG path to reduce digit-loop
             // degeneracy and tighten numeric copying fidelity from <excerpt> blocks.
@@ -1223,7 +1326,7 @@ constructor(
     val baselineBeforeTurn =
       synchronized(nonRagRunningTokens) {
         // First non-RAG turn ever for this model: seed with just the system prompt cost.
-        nonRagRunningTokens[model.name] ?: estimateTextTokens(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
+        nonRagRunningTokens[model.name] ?: estimateTextTokens(selectSystemPromptFor(model))
       }
     val projected = baselineBeforeTurn + estimateTextTokens(input)
     val hardCap = hardCapFor(model)
@@ -1253,7 +1356,7 @@ constructor(
           initialMessages = budget.trimmedHistory,
           supportImage = false,
           supportAudio = false,
-          systemInstruction = Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT),
+          systemInstruction = Contents.of(selectSystemPromptFor(model)),
           tools = emptyList(),
           enableConversationConstrainedDecoding = false,
         )
@@ -1283,7 +1386,8 @@ constructor(
     // rebuilt above, history reflects the trimmed set; otherwise it reflects everything in
     // shadow history (which mirrors what the persistent Conversation has accumulated).
     val nonRagHistoryForSnapshot = snapshotShadowHistory(model)
-    val nonRagWrappedQuestion = "<user_question>$input</user_question>"
+    val nonRagWrappedQuestion = if (model.sizeInBytes in 1..SMALL_MODEL_THRESHOLD_BYTES) input
+      else "<user_question>$input</user_question>"
     val nonRagSnapshot =
       formatContextSnapshot(
         model = model,
@@ -1330,10 +1434,11 @@ constructor(
     // Symmetric with the RAG path: wrap the user input in <user_question> so the model sees
     // a consistent structural envelope on every turn regardless of whether RAG fired. Shadow
     // history is appended with the CLEAN (un-wrapped) input below so replayed turns don't
-    // accumulate nested fences.
-    val wrappedInput = "<user_question>$input</user_question>"
+    // accumulate nested fences. Small models skip the wrapping entirely.
+    val isSmallModel = model.sizeInBytes in 1..SMALL_MODEL_THRESHOLD_BYTES
+    val finalInput = if (isSmallModel) input else "<user_question>$input</user_question>"
     super.generateResponse(
-      model, wrappedInput, images, audioMessages, onFirstToken, wrappedOnDone, onError, allowThinking
+      model, finalInput, images, audioMessages, onFirstToken, wrappedOnDone, onError, allowThinking
     )
   }
 
@@ -1354,7 +1459,7 @@ constructor(
     // (e.g. LlmChatScreen) don't supply one, so without this the post-reset conversation
     // would have NO system instruction at all.
     val effectiveSystemInstruction =
-      systemInstruction ?: Contents.of(LLM_CHAT_DEFAULT_SYSTEM_PROMPT)
+      systemInstruction ?: Contents.of(selectSystemPromptFor(model))
     super.resetSession(
       task = task,
       model = model,
